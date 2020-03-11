@@ -1,0 +1,3374 @@
+---
+title: <center>Predicting geospatial child maltreatment risk in Washington D.C.<br><br><img src="PAP_3color_logo.png" width="200" style="padding:8px"><br><img src = "urbanspatiallogo.png" width = "125" style="padding:5px"><br><br></center>
+author: <span style="font-size:20px">Ken Steif, Ph.D<br>Sydney Goldstein, M.C.P.</span>
+date: <span style="font-size:18px">March 6, 2020</span><br><br><span style="font-size:14px">Urban Spatial - [Website](http://urbanspatialanalysis.com/) / [Other Work](https://urbanspatial.github.io/ProjectsPage/)</span>
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 6
+---
+
+```{r setup, include=FALSE, warning=FALSE, messages=FALSE, echo=FALSE, cache=FALSE}
+knitr::opts_chunk$set(include=FALSE, warning=FALSE, 
+                      message=FALSE, echo=FALSE, cache=TRUE, fig.align="center")
+```
+
+```{r packages}
+library("sf")            # Spatial data objects and methods
+library("mapview")       # Interactive Map Viewing
+library("ggmap")         # ggplot2 addon for base maps
+library("spatstat")      # KDE and other spatial functions
+library("raster")        # cell-based spatial operations
+library("tidyverse")     # data manipulation framework
+library("Hmisc")         # using cut2() functions for ggplot legends
+library("fitdistrplus")  # Distribution fitting functions
+library("lubridate")     # Power tools for handling dates
+library("tidycensus")
+library("lwgeom")
+library("Hmisc")
+library("hrbrthemes")
+library("gridExtra")
+library("patchwork")
+library("spdep")         # KNN functions
+library("foreach")
+library("doParallel")
+library("corrplot")
+library("ranger")        # randomforest implimentation      
+library("glmnet")        # for Ridge and Lasso Regression
+library("knitr")         # for kable table
+library("kableExtra")
+library("FNN")           # KNN for CPS vs. NN plots
+library("groupdata2")
+library("htmltools")
+library("viridis")
+library("viridisLite")
+library("readxl")
+library("geojsonsf")
+library("tidygeocoder")
+```
+
+```{r options}
+#mapviewOptions(basemaps = c("Stamen.TonerLite", "OpenStreetMap.DE"))
+base_dir = "C:/projects/PAP_Wash_DC"
+fishnet_grid_dim = 1000
+k_direction = 8    # 4 = rook, 8 = queen
+k_nearest_neighbors = 5
+# Either k (e.g. 5 or 10) or "LOOCV"
+n_folds = "LOOCV"
+# threshold quntile for statArea grouping
+stat_area_quantile = 0.60
+# Number of simulations for CPS vs. NN
+simulations = 999
+# Number of neighbors for CPS vs. NN
+k = 5
+# random seed
+set.seed(717)
+
+```
+
+```{r SOURCE}
+source('C:/projects/PAP_Wash_DC/source_files/FUNCTIONS_DCPAP.R', echo = TRUE, keep.source = TRUE)
+source('C:/projects/PAP_Wash_DC/source_files/FEA_CREATE_VARIABLES.R', echo = TRUE, keep.source = TRUE)
+```
+
+```{r nbr}
+#neighborhood clusters from DC open data
+nbr <- geojson_sf("https://opendata.arcgis.com/datasets/f6c703ebe2534fc3800609a07bad8f5b_17.geojson") %>%
+  st_transform(102685) %>% 
+  dplyr::select(NAME, NBH_NAMES, geometry)
+
+nbr_diss <- nbr %>%
+  mutate(dissolve = 1) %>%
+  # get rid of slivers
+  st_buffer(., dist = 0.1) %>%
+  group_by(dissolve) %>%
+  summarise()
+
+nbr_rast_SP <- raster(as(nbr_diss, "Spatial"), nrows = 2000, ncol = 2000)
+```
+
+```{r wards}
+# ward shapefile from DC open data
+wards <- geojson_sf("https://opendata.arcgis.com/datasets/0ef47379cbae44e88267c01eaec2ff6e_31.geojson") %>%
+  st_transform(102685)
+```
+
+```{r basemap}
+# get basemap for visualizations
+base_map <- get_map(location = unname(st_bbox(ll(st_buffer(var_list[["ScreenedIn_Cases"]],5000)))),
+                          source = "stamen",
+                          maptype = "toner")
+```
+
+```{r malOverTime}
+# create a bar plot to look at count of maltreatment events in each year
+initial_malOT_PLOT <- var_list[["ScreenedIn_Cases"]] %>% 
+  group_by(REPORTING_PERIOD) %>% 
+  summarise(count = n()) %>% 
+  ggplot(.) +
+  geom_bar(aes(x = REPORTING_PERIOD, y = count), stat = "identity") +
+  scale_y_continuous(limits = c(0, 1000)) +
+  labs(title = "Number of maltreatment events by reporting period",
+       caption = "Figure 1.2") +
+  plotTheme()
+```
+
+```{r malOverSpace}
+# make a density map of maltreatment events in each year
+
+variable = "REPORTING_PERIOD"
+values <- unique(var_list[["ScreenedIn_Cases"]][[variable]])
+brks <- 9
+year_dat <- list()
+window_mal <- get_window(var_list[["ScreenedIn_Cases"]])
+
+for(i in seq_along(values)){
+  dat <- filter(var_list[["ScreenedIn_Cases"]], !!as.name(variable) == values[i])
+  points.ppp <- as.ppp(st_coordinates(ll(dat)),window_mal)
+  densityRaster <- raster(density(points.ppp, scalekernel=TRUE, sigma = 0.005))
+  dens_data <- gplot_data(densityRaster, maxpixels = 2500) %>%
+    mutate(!!as.name(variable) := values[i])
+  year_dat[[i]] <- dens_data
+}
+year_dat <- do.call(rbind, year_dat)
+
+initial_malOS_PLOT <- ggmap(base_map) +
+  geom_tile(data = year_dat, 
+            aes(x,y,fill = as.factor(ntile(value,brks)), 
+                group = !!as.name(variable)), alpha=0.8) +
+  scale_fill_viridis_d(name = variable) +
+  labs(title = "Density of maltreatment events by year",
+       caption = "Figure 1.3") +
+  facet_wrap(vars(!!as.name(variable))) +
+  mapTheme() +
+  theme(
+     legend.key = element_rect(fill = "white"),
+     strip.text = element_text(face = "plain", size = 11, hjust = 0),
+     strip.background = element_rect(fill = "white"),
+     legend.position = "none"
+  )
+```
+
+```{r split_mal_TrainTest}
+#will only be using three years of maltreatment data - 2017, 2018, 2019
+mal_dissolve <- var_list[["ScreenedIn_Cases"]] %>%
+  filter(REPORTING_PERIOD %in% c("FY 2017", "FY 2018", "FY 2019")) %>% 
+  mutate(value = 1) %>%
+  dplyr::select(value)
+
+#make a training/test for screened in cases in var_list
+mal_1718 <- var_list[["ScreenedIn_Cases"]] %>%
+  filter(REPORTING_PERIOD %in% c("FY 2017", "FY 2018")) 
+var_list[["ScreenedIn_1718"]] <- mal_1718
+
+mal_19 <- var_list[["ScreenedIn_Cases"]] %>%
+  filter(REPORTING_PERIOD == "FY 2019") 
+var_list[["ScreenedIn_19"]] <- mal_19
+```
+
+```{r fishnet}
+#make fishnet and mask cells that are either national parks, the capitol, and the river 
+net <- st_make_grid(nbr, cellsize = fishnet_grid_dim)
+
+# count CPS incidents per net cell - really just to get net raster into sf polygon format
+net_agg <- aggregate(mal_dissolve, net, sum) %>%
+  tibble::rowid_to_column(.,"net_id")
+
+# list of net cells IDs that intersect with DC
+net_intersect <- st_intersects(nbr, net_agg) 
+# extract DC net cells based on intersect ID
+net_DC <- net_agg[unique(unlist(net_intersect)),]
+net_hood <- st_join(net_DC, nbr, largest = TRUE)
+net_ward <- st_join(net_DC, wards, largest = TRUE)
+listw <- nb2listw(poly2nb(as(net_DC, "Spatial"), queen = TRUE), zero.policy=TRUE)
+```
+
+```{r mask}
+# get hydrology, national parks, and federal land (capitol) to make a mask
+hydro <- geojson_sf("https://opendata.arcgis.com/datasets/db65ff0038ed4270acb1435d931201cf_24.geojson") %>% 
+  st_transform(102685) %>% 
+  filter(DESCRIPTION == "River") %>% 
+  mutate(dissolve = 1) %>%
+  #buffering by 50 feet to get rid of slivers in the mask
+  st_buffer(., dist = 50) %>% 
+  group_by(dissolve) %>%
+  summarise() 
+
+nps <- geojson_sf("https://opendata.arcgis.com/datasets/14eb1c6b576940c7b876ebafb227febe_10.geojson") %>% 
+  st_transform(102685) %>% 
+  filter(st_is_valid(.) == "TRUE") %>% 
+  mutate(dissolve = 1) %>%
+  st_buffer(., dist = 50) %>% 
+  group_by(dissolve) %>%
+  summarise()
+
+capitol <- geojson_sf("https://opendata.arcgis.com/datasets/d9e8c786c9694e47979ef71a5c2f1a7a_5.geojson") %>% 
+  st_transform(102685) %>% 
+  mutate(dissolve = 1) %>%
+  st_buffer(., dist = 50) %>% 
+  group_by(dissolve) %>%
+  summarise()
+
+
+mask <- st_union(hydro, nps) %>% 
+  st_union(., capitol) %>% 
+  dplyr::select(geometry)
+
+# remove slivers
+mask_buff <- st_buffer(mask, dist = 150)
+
+# get grid cells not in the mask
+net_mask <- subset(net_DC, !(net_id %in% st_centroid(net_DC)[mask,]$net_id)) %>% dplyr::select(-value)
+mask_diss <- st_difference(nbr_diss, mask_buff)
+```
+
+```{r mal_count_nbr_ward}
+mal_by_nbr <- net_hood %>% 
+  dplyr::select(value, NAME, geometry) %>% 
+  mutate(value = replace_na(value, 0)) %>% 
+  group_by(NAME) %>% 
+  summarise(count = sum(value)) %>% 
+  mutate(cut_val = Hmisc::cut2(count, g = 5))
+
+mal_by_ward <- net_ward %>% 
+  dplyr::select(value, NAME, geometry) %>% 
+  mutate(value = replace_na(value, 0)) %>% 
+  group_by(NAME) %>% 
+  summarise(count = sum(value)) %>% 
+  mutate(cut_val = Hmisc::cut2(count, g = 5))
+```
+
+```{r mal_count_yr}
+mal_3yr <- var_list[["ScreenedIn_Cases"]] %>%
+  filter(REPORTING_PERIOD %in% c("FY 2017", "FY 2018", "FY 2019"))
+values <- unique(mal_3yr[[variable]])
+dat_3yr <- list()
+for(i in seq_along(values)){
+  #print(values[i])
+  
+  dat <- filter(mal_3yr, !!as.name(variable) == values[i]) %>% 
+    mutate(value = 1) %>% 
+    dplyr::select(value) %>% 
+    aggregate(., net, sum) %>%
+    mutate(value = ifelse(is.na(value),0,value)) %>% 
+    .[unique(unlist(st_intersects(nbr, .))),] %>% 
+    mutate(class = case_when(value == 0 ~ "0", 
+                             value > 0 & value < 0.5 ~ "0.1 to 0.49",
+                             value >= 0.5 & value < 1 ~ "0.5 to 0.99",
+                             value >= 1 & value < 3 ~ "1 to 2.99",
+                             value >= 3 ~ "3+"))
+    #mutate(class = Hmisc::cut2(value, g = 9))
+  #make_cuts(., "value", cuts = "breaks", n_breaks = 10)
+  
+  dat_3yr[[i]] <- ggmap(base_map) +
+    geom_sf(data = ll(dat), aes(fill = class), 
+            color = NA, inherit.aes = FALSE, size = 0.5, alpha = 0.8) +
+    scale_fill_viridis_d(na.value = NA,
+                         name = "Count"#,
+                         #breaks = levels(dat$class),
+                         #labels = levels(dat$class)
+    ) +
+    labs(title = paste0("Count in ",values[i])) +
+    mapTheme()
+}
+```
+
+```{r COMPARE_FISHNET_GRID_SIZE}
+# test for grid cell size
+grid_seq <- c(500,1000,1500)
+p_loc_l  <- vector(mode = "list", length = length(grid_seq))
+p_hist_l <- vector(mode = "list", length = length(grid_seq))
+for(i in seq_along(grid_seq)){
+  #cat(grid_seq[i], "\n")
+  net_i <- st_make_grid(nbr, cellsize = grid_seq[i])
+  net_agg_i <- aggregate(mal_dissolve, net_i, sum) %>% 
+    mutate(value = ifelse(is.na(value),0,value))
+  
+  net_intersect_i <- st_intersects(nbr, net_agg_i) 
+  # extract DC net cells based on intersect ID
+  net_DC_i <- net_agg_i[unique(unlist(net_intersect_i)),]
+  
+  net_DC_i$class <- Hmisc::cut2(net_DC_i$value, g = 9)
+  p_loc <- ggmap(base_map) +
+    geom_sf(data = ll(net_DC_i), aes(fill = class), 
+            color = NA, inherit.aes = FALSE, size = 0.5, alpha = 0.8) +
+    scale_fill_viridis_d(na.value = NA,
+                         name = paste0("Values","\n[quantiles]"),
+                         breaks = levels(net_agg_i$class),
+                         labels = levels(net_agg_i$class)) +
+    mapTheme()
+  
+  p_loc_l[[i]] <- p_loc
+  
+  p_hist <- ggplot(net_DC_i, aes(x=value)) +
+    geom_histogram(bins = 30) +
+    labs(title = paste0("Cell Dims = ",grid_seq[i]," ft sq")) +
+    plotTheme()
+  
+  p_hist_l[[i]] <- p_hist
+}
+
+#COMPARE_FISHNET_GRID_SIZE_plot <- grid.arrange(p_hist_l[[1]], p_hist_l[[2]], p_hist_l[[3]], p_loc_l[[1]], p_loc_l[[2]], p_loc_l[[3]], ncol = 3)
+```
+
+```{r population_blocks}
+## get total 2010 census pop for census blocks & calculate area
+dc_block <- get_decennial(geography = "block", variables = c("P001001"), year = 2010,
+                          state = "DC", county = 001, geometry = TRUE) %>%
+  st_transform(crs = 102685) %>%
+  mutate(acre = as.numeric(st_area(.) * 2.29568e-5),
+         pop_acre_rate = value / acre)
+
+net_blocks_intersect <- st_intersection(dc_block, net_DC %>% dplyr::select(-value))
+
+# group by cell and calc block stats.
+net_blocks_intersect <- net_blocks_intersect %>%
+  mutate(intersect_area_acres = as.numeric(st_area(net_blocks_intersect)*2.29568e-5)) %>%
+  group_by(net_id) %>%
+  mutate(cnt = n(),
+         pcnt_of_block = intersect_area_acres/acre,
+         intersect_pop = value * pcnt_of_block) %>%
+  arrange(net_id)
+
+# summarize the population
+fishnet_pop <- net_blocks_intersect %>% # xcc
+  group_by(net_id) %>%
+  summarise(net_pop = sum(intersect_pop)) %>%
+  filter(net_pop > 0)
+```
+
+```{r fishnet_pop_mal}
+fishnet_mal_var <- aggregate(x = mal_dissolve, by = fishnet_pop, FUN = sum) %>%
+  st_drop_geometry() %>%
+  mutate(Feature = "net_mal") %>%
+  dplyr::select(Feature,value)
+    
+fishnet_mal_var <- fishnet_mal_var %>%
+  mutate(id = rep(1:nrow(fishnet_pop))) %>%
+  spread(Feature, value) %>%
+  dplyr::select(-id) %>%
+  mutate(geometry = fishnet_pop$geometry) %>%
+  st_as_sf()
+
+fishnet_pop_mal <- st_join(fishnet_pop, fishnet_mal_var, join = st_equals) %>%
+  mutate(mal_rate = net_mal/(net_pop/100))  %>% # cps per 100 person
+  replace(is.na(.), 0) # replace NA with zero
+
+fishnet_coords <- fishnet_pop_mal %>%
+  st_centroid() %>%
+  st_coordinates() %>%
+  as.matrix()
+
+net_mal_rate <- left_join(fishnet_pop %>% as.data.frame(), net_DC %>% as.data.frame(), by = "net_id") %>% 
+  dplyr::select(-geometry.x) %>% 
+  rename(geometry = geometry.y) %>% 
+  mutate(value = replace_na(value, 0),
+         rate = value/(net_pop/100)) %>% 
+  make_cuts(., "rate", cuts = "breaks", n_breaks = 10) %>% 
+  st_sf() %>% 
+  st_transform(102685)
+```
+
+```{r distribution_gof, eval = FALSE}
+#number <- as.numeric(na.omit(net_mal_rate$value))
+#fitp <- fitdist(number,"pois", discrete = TRUE)
+#fitnb <- fitdist(number,"nbinom", discrete = TRUE)
+#cdfcomp(list(fitp,fitnb)) # plot
+#gof <- gofstat(list(fitp,fitnb))
+
+net_cell_dims <- seq(500,5000,50)
+aic_results <- matrix(nrow=length(net_cell_dims), ncol = 3)
+colnames(aic_results) <- c("cell_dim","pois","nbinom")
+for(i in seq_along(net_cell_dims)){
+  net <- st_make_grid(nbr,cellsize=net_cell_dims[i])
+  
+  cps_cnt <- aggregate(mal_dissolve, net, sum)
+
+  number <- as.numeric(na.omit(cps_cnt$value))
+  fitp <- fitdist(number,"pois", discrete = TRUE)
+  fitnb <- fitdist(number,"nbinom", discrete = TRUE)
+  gof <- gofstat(list(fitp,fitnb))
+  aic_results[i,1] <- net_cell_dims[i]
+  aic_results[i,2] <- as.numeric(gof$bic[1])
+  aic_results[i,3] <- as.numeric(gof$bic[2])
+}
+
+AIC_LINE_FITDISTR_plot <- data.frame(aic_results) %>%
+  gather(dist, aic, -cell_dim) %>%
+  rename("Distribution" = dist) %>% 
+  mutate(Distribution = case_when(
+    Distribution == "nbinom" ~ "Negative Binomial",
+    Distribution == "pois"   ~ "Poisson"
+  )) %>% 
+  ggplot(., aes(x = cell_dim, y = aic, group = Distribution, color = Distribution)) +
+  geom_line() +
+  labs(y = "AIC - goodness of fit",
+       x = "Fishnet Cell Dimension (feet)") +
+  plotTheme()
+```
+
+```{r start_parallel_backend}
+cl <- makePSOCKcluster(24)
+registerDoParallel(cl)
+```
+
+```{r agg_euclid_nn_features}
+# feature engineering - make aggregate, euclidean distance, and nearest neighbor features
+NN_results <- NN_point_features(var_list, net_DC, k_nearest_neighbors)
+agg_results <- Aggregate_points_Features(var_list, net_DC)
+ED_results <- Euclidean_point_features(var_list, nbr_rast_SP, nbr_diss, net_DC)
+```
+
+```{r stop_parallel_backend}
+stopCluster(cl)
+```
+
+```{r census_feature_download}
+# get census variables
+vars_sf1 <- c("P001001",  # Total Population,
+              "H001001",  # housing units
+              "H005001",  # vacant housing,
+              "H004002",  # owned and mortgaged,
+              "H004004",  # renter occupied
+              "H004001",  # occupied housing units
+              "H013001",  # Houshold size
+              "P036001",  # Population in families
+              "P036002",  # Population under 18yo
+              "P012003",  # Male under 5yo
+              "P012004",  # Male under 5-9yo
+              "P012005",  # Male under 10-14yo
+              "P012006",  # Male under 15-17yo
+              "P012027",  # Female under 5yo
+              "P012028",  # Female under 5-9yo
+              "P012029",  # Female under 10-14yo
+              "P012030"   # Female under 15-17yo
+            )
+vars_sf1_desc <- c("Total Pop",
+                   "Housing units",
+                   "Housing, vacant",
+                   "Housing, owned",
+                   "Housing, rented",
+                   "Housing, occupied units",
+                   "Houshold size",
+                   "Families Pop",
+                   "Pop, under 18y",
+                   "Male under 5y",
+                   "Male under 5-9y",
+                   "Male under 10-14y",
+                   "Male under 15-17y",
+                   "Female under 5y",
+                   "Female under 5-9y",
+                   "Female under 10-14y",
+                   "Female under 15-17y")
+vars_names <- data.frame(variable = vars_sf1, var_name = vars_sf1_desc, stringsAsFactors = FALSE)
+DC_block_sf1 <- get_decennial(geography = "block", variables = vars_sf1, year = 2010, summary_var = "P001001",
+                                state = "DC", county = 001, geometry = TRUE) %>%
+  st_transform(crs = 102685) %>%
+  spread(., variable, value)
+```
+
+```{r sf1_features}
+sf1_block <- DC_block_sf1 %>%
+  mutate(acre = as.numeric(st_area(DC_block_sf1)*2.29568e-5))
+
+net_blocks_intersect <- st_intersection(sf1_block, net_DC) 
+
+# group by cell and calc block stats.
+net_blocks_intersect2 <- net_blocks_intersect %>%
+  mutate(intersect_area_acres = as.numeric(st_area(net_blocks_intersect)*2.29568e-5)) %>%
+  group_by(net_id) %>%
+  mutate(cnt = n(),
+         pcnt_of_block = intersect_area_acres/acre) %>%
+         # intersect_pop = value * pcnt_of_block) %>%
+  arrange(net_id) %>%
+  mutate_at(vars(matches("^P|^H")), funs(.* pcnt_of_block))
+
+### summarise intersect pops to each net cell and create pop rates for some
+fishnet_sf1 <- net_blocks_intersect2 %>% # xcc
+  group_by(net_id) %>%
+  summarise_at(vars(matches("^P|^H")), funs(sum)) %>%
+  dplyr::select(-pcnt_of_block) %>%
+  rename_at(vars(vars_sf1), function(x) vars_sf1_desc) %>%
+  mutate(`Pop, under 5y`     = rowSums(st_drop_geometry(.[grep("5y$", names(.))])),
+         `Pop, under 5-9y`   = rowSums(st_drop_geometry(.[grep("5-9y$", names(.))])),
+         `Pop, under 10-14y` = rowSums(st_drop_geometry(.[grep("10-14y$", names(.))])),
+         `Pop, under 15-17y` = rowSums(st_drop_geometry(.[grep("15-17y$", names(.))])),
+         `Pop, under 10y`    = `Pop, under 5y` + `Pop, under 5-9y`,
+         `Pop, 10-17y`       = `Pop, under 10-14y` + `Pop, under 15-17y`) %>%
+  mutate_at(vars(matches("^Male|^Female|^Pop")), 
+            funs(rate = divide_by(.,`Total Pop`/100)))
+
+## cast data frame to list of variables
+sf1_results <- fishnet_sf1 %>%
+  gather(variable, value, -net_id, -geometry) %>%
+  mutate(feature_name = paste0("SF1_",variable)) %>%
+  group_by(variable) %>%
+  nest() %>%
+  pull(data)
+names(sf1_results) <- paste0("SF1_",setdiff(colnames(fishnet_sf1), c("net_id","geometry")))
+```
+
+```{r nearest_neighbor_feature_combine}
+features <- data.frame(net_id = NN_results[[1]]$net_id, stringsAsFactors = FALSE)
+for(i in  seq_along(NN_results)){
+  feat_i <- NN_results[[i]] %>%
+    st_drop_geometry() %>%
+    dplyr::select(net_id, feature_name, value) %>%
+    spread(feature_name, value)
+  features <- left_join(features, feat_i, by = "net_id")
+}
+# join features to our target
+NN_features <- features %>%
+  left_join(., st_drop_geometry(fishnet_pop_mal), by = "net_id") 
+```
+
+```{r euclidean_distance_feature_combine}
+features <- data.frame(net_id = ED_results[[1]][[1]]$net_id, stringsAsFactors = FALSE)
+for(i in  seq_along(ED_results[[1]])){
+  feat_i <- ED_results[[1]][[i]] %>%
+    st_drop_geometry() %>%
+    dplyr::select(net_id, feature_name, value = mean_dist ) %>% ### mean_dist  !!!
+    spread(feature_name, value)
+  features <- left_join(features, feat_i, by = "net_id")
+}
+# join features to our target of cps_rate
+ED_features <- features %>%
+  left_join(., st_drop_geometry(fishnet_pop_mal), by = "net_id")
+```
+
+```{r agg_feature_combine}
+features <- data.frame(net_id = agg_results[[1]]$net_id, stringsAsFactors = FALSE)
+for(i in  seq_along(ED_results[[1]])){
+  feat_i <- agg_results[[i]] %>%
+    st_drop_geometry() %>%
+    dplyr::select(net_id, feature_name, value) %>%
+    spread(feature_name, value)
+  features <- left_join(features, feat_i, by = "net_id")
+}
+# join features to our target of cps_rate
+agg_features <- features %>%
+  left_join(., st_drop_geometry(fishnet_pop_mal), by = "net_id")
+```
+
+```{r census_feature_combine}
+features <- data.frame(net_id = sf1_results[[1]]$net_id, stringsAsFactors = FALSE)
+for(i in  seq_along(sf1_results)){
+  feat_i <- sf1_results[[i]] %>%
+    st_drop_geometry() %>%
+    dplyr::select(net_id, feature_name, value) %>%
+    spread(feature_name, value)
+  features <- left_join(features, feat_i, by = "net_id")
+}
+# join features to our target of cps_rate
+sf1_features <- features %>%
+  left_join(., st_drop_geometry(fishnet_pop_mal), by = "net_id")
+```
+
+```{r all_features}
+ALL_FEATURES <- full_join(NN_features, agg_features, by = "net_id") %>%
+  full_join(.,ED_features, by = "net_id") %>% 
+  full_join(., sf1_features, by = "net_id") %>% 
+  dplyr::select(-net_pop.y, -net_pop.y.y, -net_pop.x.x, -net_mal.y, -mal_rate.y, 
+                -net_mal.x.x, -net_mal.y.y, -mal_rate.x.x, -mal_rate.y.y) %>% 
+  rename(net_pop = net_pop.x,
+         net_mal = net_mal.x,
+         mal_rate = mal_rate.x)
+```
+
+```{r pubHousingFeat}
+# adding in a binary feature of whether grid cell is in public housing area or not (don't end up using)
+PublicHousing_Areas <- geojson_sf("https://opendata.arcgis.com/datasets/7f40eee5afaa4210959c2a55328a0cab_15.geojson") %>% 
+  filter(!is.na(geometry)) %>%
+  dplyr::select(NAME, ADDRESS, geometry) %>%
+  st_transform(102685)
+
+net_PH <- st_join(net_DC %>% dplyr::select(-value), PublicHousing_Areas %>% dplyr::select(-ADDRESS), largest = TRUE) %>% 
+  mutate(bi_Public_Housing = as.factor(ifelse(is.na(NAME), 0, 1))) %>% 
+  mutate_at(vars(NAME), funs(replace(., is.na(.), "Not PH"))) %>% 
+  rename(PH_Name = NAME)
+ALL_FEATURES_PH <- left_join(ALL_FEATURES, net_PH, by = "net_id")
+```
+
+```{r featEng_example_PLOT1}
+
+#pull out grocery stores
+grocers <- var_list$BUSI_Grocers
+grocers_map <- ggmap(base_map) +
+  geom_sf(data = ll(grocers), inherit.aes = FALSE, color = "red", size = 2, alphae = 0.9) +
+  geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 1) +
+  labs(title = "Grocery Stores",
+       subtitle = "Grocery store locations") +
+  #scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "Count") +
+  mapTheme()
+
+
+#grab and map count
+grocers_agg <- ALL_FEATURES_PH %>% 
+  dplyr::select(agg_BUSI_Grocers, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(agg_BUSI_Grocers), 0, agg_BUSI_Grocers)) %>% 
+  st_sf()
+grocers_agg <- make_cuts(grocers_agg, "value", cuts = "breaks", n_breaks = 5)
+grocers_agg_map <- ggmap(base_map) +
+  geom_sf(data = ll(grocers_agg), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  # geom_sf(data = ll(rec_centers), inherit.aes = FALSE, color = "red", size = 4) +  
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(subtitle = "Grocery store count\nby fishnet") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "Count") +
+  mapTheme()
+
+#grab and counteuclidean distance
+grocers_ed <- ALL_FEATURES_PH %>% 
+  dplyr::select(ed_BUSI_Grocers, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(ed_BUSI_Grocers), 0, ed_BUSI_Grocers)) %>% 
+  st_sf()
+grocers_ed <- make_cuts(grocers_ed, "value",  "value", cuts = "breaks", n_breaks = 5)
+grocers_ed_map <- ggmap(base_map) +
+  geom_sf(data = ll(grocers_ed), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data = ll(grocers), inherit.aes = FALSE, color = "red", size = 1, alpha = 0.9) +
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(subtitle = "Grocery store\neuclidean distance") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "NN Distance") +
+  mapTheme()
+
+#grab and map avg nn 
+grocers_NN <- ALL_FEATURES_PH %>% 
+  dplyr::select(NN_BUSI_Grocers, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(NN_BUSI_Grocers), 0, NN_BUSI_Grocers)) %>% 
+  st_sf()
+grocers_NN <- make_cuts(grocers_NN, "value",  "value", cuts = "breaks", n_breaks = 5)
+grocers_NN_map <- ggmap(base_map) +
+  geom_sf(data = ll(grocers_NN), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data = ll(grocers), inherit.aes = FALSE, color = "red", size = 1, alpha = 0.9) +
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(subtitle = "Grocery store average\nnearest neighbor distance") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "NN Distance") +
+  mapTheme()
+
+featEng_PLOT1 <- cowplot::plot_grid(grocers_map,grocers_agg_map,grocers_ed_map, grocers_NN_map, align="hv", axis = "rlbt", ncol=2)
+```
+
+```{r featEng_example_PLOT2}
+
+#pull out grocery stores
+shelters <- var_list$Homeless_Shelters
+shelters_map <- ggmap(base_map) +
+  geom_sf(data = ll(shelters), inherit.aes = FALSE, color = "red", size = 2, alphae = 0.9) +
+  geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 1) +
+  labs(title = "Homeless Shelter locations") +
+  #scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "Count") +
+  mapTheme()
+
+
+#grab and map count
+shelters_agg <- ALL_FEATURES_PH %>% 
+  dplyr::select(agg_Homeless_Shelters, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(agg_Homeless_Shelters), 0, agg_Homeless_Shelters)) %>% 
+  st_sf()
+shelters_agg <- make_cuts(shelters_agg, "value", cuts = "breaks", n_breaks = 5)
+shelters_agg_map <- ggmap(base_map) +
+  geom_sf(data = ll(shelters_agg), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  # geom_sf(data = ll(rec_centers), inherit.aes = FALSE, color = "red", size = 4) +  
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(title = "Homeless Shelter count\nby fishnet") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "Count") +
+  mapTheme()
+
+#grab and counteuclidean distance
+shelters_ed <- ALL_FEATURES_PH %>% 
+  dplyr::select(ed_Homeless_Shelters, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(ed_Homeless_Shelters), 0, ed_Homeless_Shelters)) %>% 
+  st_sf()
+shelters_ed <- make_cuts(shelters_ed, "value",  "value", cuts = "breaks", n_breaks = 5)
+shelters_ed_map <- ggmap(base_map) +
+  geom_sf(data = ll(shelters_ed), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data = ll(shelters), inherit.aes = FALSE, color = "red", size = 1, alpha = 0.9) +
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(title = "Homeless shelters\neuclidean distance") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "NN Distance") +
+  mapTheme()
+
+#grab and map avg nn 
+shelters_NN <- ALL_FEATURES_PH %>% 
+  dplyr::select(NN_Homeless_Shelters, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(NN_Homeless_Shelters), 0, NN_Homeless_Shelters)) %>% 
+  st_sf()
+shelters_NN <- make_cuts(shelters_NN, "value",  "value", cuts = "breaks", n_breaks = 5)
+shelters_NN_map <- ggmap(base_map) +
+  geom_sf(data = ll(shelters_NN), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data = ll(shelters), inherit.aes = FALSE, color = "red", size = 1, alpha = 0.9) +
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(title = "Homeless Shelters average\nnearest neighbor distance") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "NN Distance") +
+  mapTheme()
+
+featEng_PLOT2 <- cowplot::plot_grid(shelters_map,shelters_agg_map,shelters_ed_map, shelters_NN_map, align="hv", axis = "rlbt", ncol=2)
+```
+
+```{r featEng_example_PLOT3}
+
+#pull out grocery stores
+cashing <- var_list$Check_Cashing
+cashing_map <- ggmap(base_map) +
+  geom_sf(data = ll(cashing), inherit.aes = FALSE, color = "red", size = 2, alphae = 0.9) +
+  geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 1) +
+  labs(title = "Check Cashing",
+       subtitle = "Check cashing locations") +
+  #scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "Count") +
+  mapTheme()
+
+
+#grab and map count
+cashing_agg <- ALL_FEATURES_PH %>% 
+  dplyr::select(agg_Check_Cashing, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(agg_Check_Cashing), 0, agg_Check_Cashing)) %>% 
+  st_sf()
+cashing_agg <- make_cuts(cashing_agg, "value", cuts = "breaks", n_breaks = 5)
+cashing_agg_map <- ggmap(base_map) +
+  geom_sf(data = ll(cashing_agg), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  # geom_sf(data = ll(rec_centers), inherit.aes = FALSE, color = "red", size = 4) +  
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(subtitle = "Check cashing count\nby fishnet") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "Count") +
+  mapTheme()
+
+#grab and counteuclidean distance
+cashing_ed <- ALL_FEATURES_PH %>% 
+  dplyr::select(ed_Check_Cashing, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(ed_Check_Cashing), 0, ed_Check_Cashing)) %>% 
+  st_sf()
+cashing_ed <- make_cuts(cashing_ed, "value",  "value", cuts = "breaks", n_breaks = 5)
+cashing_ed_map <- ggmap(base_map) +
+  geom_sf(data = ll(cashing_ed), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data = ll(cashing), inherit.aes = FALSE, color = "red", size = 1, alpha = 0.9) +
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(subtitle = "Check cashing\neuclidean distance") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "NN Distance") +
+  mapTheme()
+
+#grab and map avg nn 
+cashing_NN <- ALL_FEATURES_PH %>% 
+  dplyr::select(NN_Check_Cashing, net_id, geometry) %>% 
+  mutate(value = ifelse(is.na(NN_Check_Cashing), 0, NN_Check_Cashing)) %>% 
+  st_sf()
+cashing_NN <- make_cuts(cashing_NN, "value",  "value", cuts = "breaks", n_breaks = 5)
+cashing_NN_map <- ggmap(base_map) +
+  geom_sf(data = ll(cashing_NN), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  geom_sf(data = ll(cashing), inherit.aes = FALSE, color = "red", size = 1, alpha = 0.9) +
+  #geom_sf(data = ll(nbr_diss), inherit.aes = FALSE, color = "black", fill = NA, size = 2) +
+  labs(subtitle = "Check cashing average\nnearest neighbor distance") +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1, name = "NN Distance") +
+  mapTheme()
+
+featEng_PLOT3 <- cowplot::plot_grid(cashing_map,cashing_agg_map,cashing_ed_map, cashing_NN_map, align="hv", axis = "rlbt", ncol=2)
+```
+
+```{r featEng_example_PLOT4}
+pubHousing_bi <- ALL_FEATURES_PH %>% 
+  dplyr::select(bi_Public_Housing, net_id, geometry) %>% 
+  st_sf()
+
+pubHousing_PLOT <- ggmap(base_map) +
+  geom_sf(data = ll(pubHousing_bi), aes(fill = as.factor(bi_Public_Housing)),
+          color = NA, inherit.aes = FALSE, alpha = 0.9) +
+  scale_fill_viridis_d(na.value=NA, name = " ", option = "D") +
+  labs(title = "Fisnet grid cells in Public Housing Areas",
+       subtitle = "0 - Not Public Housing; 1 - In Public Housing") +
+  mapTheme()
+```
+
+```{r correlation_allfeatures}
+training_forCorr <- ALL_FEATURES %>% 
+  dplyr::select(-ed_ScreenedIn_Cases, -agg_ScreenedIn_Cases, -NN_ScreenedIn_Cases,
+                -contains("19")) %>%
+  dplyr::rename_all(funs(make.names(.))) %>% 
+  rename(net_mal1718 = agg_ScreenedIn_1718) %>% 
+  mutate(mal_rate = net_mal1718/(net_pop/100)) %>% 
+  mutate_all(funs(replace(., is.na(.), 0)))
+
+# Compute correlation between all pariwise features
+cor_ALL <- cor(training_forCorr)
+All_cors <- cor_ALL[,"net_mal1718"]
+# Compute p-values
+p.mat_ALL <- cor.mtest(training_forCorr)$p
+p.mat_ALL <- p.mat_ALL[,which(colnames(cor_ALL)=="net_mal1718")]
+# Prepare data for plotting
+cor_ALL_plot <- data.frame(feature = names(All_cors), 
+                           cor = as.numeric(All_cors),
+                           p_value   = p.mat_ALL) %>%
+  filter(!(feature %in% c("mal_rate","net_mal1718","net_pop","net_id"))) %>%
+  #filter(!(feature %in% grep("CPS", names(All_cors),value=T))) %>%
+  arrange(desc(cor)) %>% 
+  mutate(p_value = ifelse(p_value >= 0.1, "Not Significant", "Significant"))
+cor_ALL_plot$feature <- factor(cor_ALL_plot$feature,
+                               levels=cor_ALL_plot[order(cor_ALL_plot$cor,
+                                                         decreasing=F),]$feature)
+```
+
+```{r corr_features_strong}
+features_cor <- cor_ALL_plot %>%
+  mutate(feature = as.character(feature)) %>%
+  arrange(desc(cor)) %>%
+  pull(feature)
+top_n <- head(features_cor,10)
+bottom_n <- tail(features_cor,10)
+
+features_strong_cor <- training_forCorr %>%
+  dplyr::select(top_n, bottom_n, net_mal1718, mal_rate, net_pop, net_id) %>%
+  base::identity()
+```
+
+```{r cor_strong_protective}
+features_protective_all <- training_forCorr %>%
+  dplyr::select(contains("Child_Development_Centers"),
+                contains("Food_Bank"),
+                contains("Homeless_Shelters"),
+                contains("Homeless_Services"),
+                contains("Playgrounds"),
+                contains("Police_Stations"),
+                contains("Rec_Centers"),
+                contains("ReligiousOrgs"),
+                contains("Schools"),
+                contains("SNAP"),
+                contains("WIC"),
+                contains("Fire_Stations"),
+                contains("Parks"),
+                contains("BUSI_Pharmacies"),
+                contains("BUSI_Grocers"),
+                contains("Libraries"),
+                NN_ScreenedIn_1718,
+                net_mal1718, mal_rate, net_pop, net_id)
+
+features_strong_protective_names <- cor_ALL_plot %>% 
+  filter(feature %in% names(features_protective_all)) %>%
+  mutate(prefix = str_extract(feature, "^[^_]+(?=_)"),
+         suffix = str_extract(feature, "(?<=_)[^_].*"),
+         feature = as.character(feature)) %>%
+  group_by(suffix) %>%
+  # Highest absolute correlation
+  slice(which.max(abs(cor)))
+
+features_protective_strong <- features_protective_all %>%
+  dplyr::select(features_strong_protective_names$feature,
+                NN_ScreenedIn_1718,
+                net_mal1718, mal_rate, net_pop, net_id)
+```
+
+```{r cor_strong_risk}
+features_risk_all <- training_forCorr %>%
+  dplyr::select(contains("Check_Cashing"),
+                contains("BusStops"),
+                contains("NonDepository_Banks"),
+                contains("Liquor_Licenses"),
+                contains("VIO.1718"),
+                contains("CRIME.1718"),
+                contains("Laundromats"),
+                contains("Convenience.Stores"),
+                contains("Hair.Nail.Salons"),
+                contains("Public_Housing"),
+                NN_ScreenedIn_1718,
+                net_mal1718, mal_rate, net_pop, net_id)
+
+features_risk_strong_names <- cor_ALL_plot %>%
+  filter(feature %in% names(features_risk_all)) %>%
+  mutate(prefix = str_extract(feature, "^[^_]+(?=_)"),
+         suffix = str_extract(feature, "(?<=_)[^_].*"),
+         feature = as.character(feature)) %>%
+  group_by(suffix) %>%
+  slice(which.max(abs(cor)))
+
+features_risk_strong <- features_risk_all %>%
+  dplyr::select(features_risk_strong_names$feature,
+                NN_ScreenedIn_1718,
+                net_mal1718, mal_rate, net_pop, net_id) %>%
+  base::identity()
+```
+
+```{r spatial_weights_lattice}
+fishnet_knn <- knn2nb(knearneigh(fishnet_coords, k_direction))
+fishnet_Weights <- nb2listw(fishnet_knn, style="W")
+localMorans  <- as.data.frame(localmoran(fishnet_pop_mal$net_mal, fishnet_Weights))
+globalMorans <- moran.mc(fishnet_pop_mal$net_mal, fishnet_Weights, nsim=999)
+```
+
+```{r localMorans}
+localMorans <- as.data.frame(localmoran(fishnet_pop_mal$net_mal, fishnet_Weights))
+# Moran's I join
+fishnet_pop_cps_morans        <- fishnet_pop_mal
+fishnet_pop_cps_morans$Ii     <- localMorans$Ii
+fishnet_pop_cps_morans$pvalue <- localMorans$`Pr(z > 0)`
+fishnet_pop_cps_morans        <- cbind(fishnet_coords, fishnet_pop_cps_morans)
+
+# Bin maltreatment event counts
+#fishnet_pop_cps_morans_cut <- make_cuts(fishnet_pop_cps_morans, "net_mal",
+                                        #cuts = "breaks", n_breaks = 10)
+
+fishnet_pop_cps_morans_cut <- fishnet_pop_cps_morans %>% 
+  mutate(cut_val = case_when(net_mal == 0 ~ "0",
+                             net_mal > 0 & net_mal < 0.5 ~ "0.1 to 0.49",
+                             net_mal >= 0.5 & net_mal < 1 ~ "0.5 to 0.99",
+                             net_mal >= 1 & net_mal < 3 ~ "1 to 2.99",
+                             net_mal >= 3 ~ "3+"))
+# Plot maltreatment events (assign to a variable)
+plot_cps <- ggmap(base_map) +
+  geom_sf(data = ll(fishnet_pop_cps_morans_cut), aes(fill = cut_val),
+          color = NA, inherit.aes = FALSE, alpha = 0.9) +
+  scale_fill_viridis_d(na.value=NA, name = "Maltreatment\nEvents", option = "D" ) +
+  labs(title = "Maltreatment count by fishnet\nFY 2017 - FY 2019",
+                          caption = "Figure 3.8") +
+  mapTheme()
+
+# Bin Local Moran's I statistic
+Ii_cut <- fishnet_pop_cps_morans %>%
+  mutate(Ii_cut_val = as.character(Hmisc::cut2(.$Ii, 
+                                               cuts = as.numeric(quantile(round(fishnet_pop_cps_morans$Ii,2), 
+                                                                          na.rm=T, p = seq(0,1,0.25))))))
+# plot binned Local Moran's I statistic (assign to a variable)
+plot_Ii <- ggmap(base_map) +
+  geom_sf(data = ll(na.omit(Ii_cut)), aes(fill = Ii_cut_val),
+          color = NA, inherit.aes = FALSE, alpha = 0.9) +
+  scale_fill_viridis_d(na.value=NA, name = "Local Moran's I", option = "D") +
+  labs(title = "Local Moran's I value") +
+  mapTheme()
+
+# Bin Local Moran's I p-value
+p_cut <- fishnet_pop_cps_morans %>%
+  mutate(pval_cut = ifelse(pvalue > 0.05, "Not Significant", "Significant"))
+# Plot binned p-value (assign to a variable)
+plot_p <- ggmap(base_map) +
+  geom_sf(data = ll(p_cut), aes(fill = pval_cut),
+          color = NA, inherit.aes = FALSE, alpha = 0.9) +
+  scale_fill_viridis_d(na.value=NA, name = "p-value", option = "D") +
+  labs(title = "Statistically significant\nmaltreatment clusters") +
+  mapTheme()
+
+# use `cowplot` to put plots together
+MORANS_I_P_plot <- cowplot::plot_grid(plot_cps, plot_p, 
+                                      ncol = 2, align = "hv", axis = "lrbt")
+```
+
+```{r risk_points_KDE_compute}
+
+risk_names <- c("Check_Cashing", "NonDepository_Banks", "Liquor_Licenses", "BusStops", "Public_Housing",  
+                "VIO.1718_Sanitation Enforcement", "VIO.1718_Abandoned Vehicle - On Public Property",
+                "VIO.1718_Abandoned Vehicle - On Private Property", "VIO.1718_Illegal Dumping",
+                "VIO.1718_Grass and Weeds Mowing", "CRIME.1718_THEFT F/AUTO", "CRIME.1718_BURGLARY", "CRIME.1718_THEFT/OTHER",
+                "CRIME.1718_ASSAULT W/DANGEROUS WEAPON", "CRIME.1718_MOTOR VEHICLE THEFT", "CRIME.1718_ROBBERY",
+                "CRIME.1718_SEX ABUSE", "CRIME.1718_HOMICIDE", "BUSI_Laundromats", "BUSI_Convenience Stores", 
+                "BUSI_Hair/Nail Salons")
+risk_var_list <- var_list[grep(paste(risk_names,collapse="|"), names(var_list), value = TRUE)]
+names(risk_var_list) <- c("Check_Cashing", "NonDepository_Banks", "Liquor Licenses", "Bus Stops", "Public Housing", 
+                "Sanitation Enforcement", "Abandoned Vehicle -\nPublic Property",
+                "Abandoned Vehicle -\nPrivate Property", "Illegal Dumping", 
+                "Grass and Weeds Mowing", "Theft F/Auto", "Burglary", "Theft/Other",
+                "Assault s/Dangerous Weapon", "Motor Vehicle Theft", "Robbery",
+                "Sexual Abuse", "Homicide", "Laundromats", "Convenience Stores", 
+                "Hair/Nail Salons")
+
+risk_plot_dat <- list()
+brks <- 9
+window <- get_window(var_list[["ScreenedIn_Cases"]], buff_dist = 10000)
+for(i in seq_along(risk_var_list)){
+  var_dat <- risk_var_list[[i]]
+  points.ppp <- as.ppp(st_coordinates(ll(var_dat)),window)
+  densityRaster <- raster(density(points.ppp, scalekernel=TRUE, sigma = 0.005))
+  dens_data <- gplot_data(densityRaster, maxpixels = 2500) %>%
+    mutate(variable = names(risk_var_list)[i])
+  risk_plot_dat[[i]] <- dens_data
+}
+risk_plot_dat <- do.call(rbind, risk_plot_dat)
+
+# one-liner to extract all 'geometry' cols from list and rbind
+risk_compile <- sf::st_as_sf(data.table::rbindlist(lapply(risk_var_list, '[', "geometry")))
+risk.points.ppp <- as.ppp(st_coordinates(ll(risk_compile)),window)
+risk_densityRaster <- raster(density(risk.points.ppp, scalekernel=TRUE, sigma = 0.005))
+risk_aggregate_plot_data <- gplot_data(risk_densityRaster, maxpixels = 2500) %>%
+    mutate(variable = "Risk")
+```
+
+```{r RISK_KDE_FACET_PLOT}
+RISK_KDE_FACET_PLOT <- ggmap(base_map) +
+  geom_tile(data = risk_plot_dat, 
+            aes(x,y,fill = as.factor(ntile(value,brks)), 
+                group = variable), alpha=0.8) +
+  scale_fill_viridis_d(name = variable) +
+  facet_wrap(~variable) +
+  labs(title = "Spatial density of risk factors",
+       caption = "Figure 3.6") +
+  mapTheme() +
+  theme(
+    legend.key = element_rect(fill = "white"),
+    strip.text = element_text(face = "plain", size = 11, hjust = 0),
+    legend.position = "none",
+    strip.background = element_rect(fill = "white")
+  )
+```
+
+```{r protective_points_KDE_compute}
+protective_names <- c("Child_Development_Centers", "Food_Bank", "Homeless_Services", 
+                      "Homeless_Shelters", "Playgrounds", "Police_Stations", "Rec_Centers", 
+                      "ReligiousOrgs", "Schools", "SNAP", "WIC", "Fire_Stations", "Parks", 
+                      "Libraries", "BUSI_Grocers", "BUSI_Pharmacies")
+protective_var_list <- var_list[grep(paste(protective_names,collapse="|"), names(var_list), value = TRUE)]
+names(protective_var_list) <- c("Child Development Centers", "Food Bank", "Homeless Services", 
+                      "Homeless_Shelters", "Playgrounds", "Police Stations", "Rec Centers", 
+                      "ReligiousOrgs", "Schools", "SNAP", "WIC", "Fire Stations", "Parks", 
+                      "Libraries", "Grocers", "Pharmacies")
+
+protective_plot_dat <- list()
+window <- get_window(var_list[["ScreenedIn_Cases"]], buff_dist = 10000)
+for(i in seq_along(protective_var_list)){
+  var_dat <- protective_var_list[[i]]
+  points.ppp <- as.ppp(st_coordinates(ll(var_dat)),window)
+  densityRaster <- raster(density(points.ppp, scalekernel=TRUE, sigma = 0.005))
+  dens_data <- gplot_data(densityRaster, maxpixels = 2500) %>%
+    mutate(variable = names(protective_var_list)[i])
+  protective_plot_dat[[i]] <- dens_data
+}
+protective_plot_dat <- do.call(rbind, protective_plot_dat)
+
+# one-liner to extract all 'geometry' cols from list and rbind
+protective_compile <- sf::st_as_sf(data.table::rbindlist(lapply(protective_var_list, '[', "geometry")))
+protective.points.ppp <- as.ppp(st_coordinates(ll(protective_compile)),window)
+protective_densityRaster <- raster(density(protective.points.ppp, scalekernel=TRUE, sigma = 0.005))
+protective_aggregate_plot_data <- gplot_data(protective_densityRaster, maxpixels = 2500) %>%
+    mutate(variable = "Protective")
+```
+
+```{r PROTECTIVE_KDE_FACET_PLOT}
+
+PROTECTIVE_KDE_FACET_PLOT <- ggmap(base_map) +
+  geom_tile(data = protective_plot_dat, 
+            aes(x,y,fill = as.factor(ntile(value,brks)), 
+                group = variable), alpha=0.8) +
+  scale_fill_viridis_d(name = variable) +
+  facet_wrap(~variable) +
+  labs(title = "Spatial density of protective factors",
+       caption = "Figure 3.5") +
+  mapTheme() +
+  theme(
+    legend.key = element_rect(fill = "white"),
+    strip.text = element_text(face = "plain", size = 11, hjust = 0),
+    legend.position = "none",
+    strip.background = element_rect(fill = "white")
+  )
+```
+
+```{r protective_closeness_test}
+business_protective_name <- var_list[["BusinessProject"]] %>%
+  filter(Category == "Protective") %>%
+  mutate(SELECTED_SIC_DESC = paste0("BUSI_",SELECTED_SIC_DESC)) %>%
+  pull(SELECTED_SIC_DESC) %>%
+  unique()
+
+protective_class <- c("Child_Development_Centers", "Food_Bank", "Homeless_Services", 
+                      "Homeless_Shelters", "Playgrounds", "Police_Stations", "Rec_Centers", 
+                      "ReligiousOrgs", "Schools", "SNAP", "WIC", "Fire_Stations", "Parks", 
+                      "Libraries")
+
+business_protective <- var_list[business_protective_name[business_protective_name %in% names(var_list)]]
+resource_protective <- var_list[protective_class[protective_class %in% names(var_list)]]
+
+protective_list <- do.call(c, list(resource_protective, business_protective))
+names(protective_list) <- c("Child Development Centers", "Food Bank", "Homeless Services", "Homeless Shelters",
+                            "Playgrounds", "Police Stations", "Rec Centers", "Religious Organizations",
+                            "Schools", "SNAP", "WIC", "Fire Stations", "Parks", "Libraries", "Pharmacies", "Grocers")
+
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+
+rnd_protective_p_results_total <- NULL
+rnd_protective_vec_total <- NULL
+protective_mean_NN <- NULL
+k_nearest_neighbors <- 3
+for(j in seq_along(protective_list)){
+  protective_desc <- protective_list[[j]]
+  cat(names(protective_list)[j], "\n")
+  # need below b/c PoliceStation feature only has 5 featuresO
+  k_nearest_neighbors_i <- ifelse(nrow(protective_desc) <= 15,
+                                  1, k_nearest_neighbors)
+  protective_mal_NN <- nn_function(st_coordinates(protective_desc),
+                             st_coordinates(mal_dissolve), k_nearest_neighbors_i)
+  protective_mal_NN <- mean(protective_mal_NN$value)
+
+
+  rnd_protective_results <- foreach(i = seq_len(simulations),
+                              .packages = c('sf', 'dplyr', 'FNN', 'tibble', 'tidyr'),
+                              .combine  = c) %dopar% {
+                                # cat(i,"\n")
+                                if(nrow(protective_desc) > k_nearest_neighbors_i){
+                                  ## b/c low count (e.g. police station) can return zero samples
+                                  protective_mal_NN_rnd <- NULL
+                                  while(length(protective_mal_NN_rnd) == 0){
+                                      protective_mal_NN_rnd <- sf::st_sample(mask_diss, nrow(protective_desc))
+                                  }
+                                  protective_mal_NN_rnd <- protective_mal_NN_rnd %>% 
+                                    st_coordinates(.) %>%
+                                    nn_function(., st_coordinates(mal_dissolve), k_nearest_neighbors_i)
+                                } else {
+                                  protective_mal_NN_rnd <- NA
+                                }
+                              }
+  #rnd_protective_p_results <- data.frame(p = map_dbl(rnd_protective_results,
+   #                                            function(x) 1-ecdf(x)(protective_mal_NN)),
+    #                               Feature = names(protective_list)[j])
+  #rnd_protective_p_results_total <- rbind(rnd_protective_p_results_total, rnd_protective_p_results)
+
+  rnd_protective_vec <- data.frame(dist = as.numeric(map_dbl(rnd_protective_results, mean)),
+                             Feature = names(protective_list)[j])
+  rnd_protective_vec_total <- rbind(rnd_protective_vec_total, rnd_protective_vec)
+  
+  rnd_protective_p_results <- rnd_protective_vec %>% 
+    mutate(mean = protective_mal_NN) %>% 
+    filter(dist > mean) %>% 
+    summarise(count = n()) %>% 
+    mutate(diff = 1000 - count,
+           p = diff/count,
+           Feature = names(protective_list)[j]) %>% 
+    dplyr::select(Feature, p)
+  
+  rnd_protective_p_results_total <- rbind(rnd_protective_p_results_total, rnd_protective_p_results)
+
+  protective_mean_NN <- rbind(protective_mean_NN, data.frame(mean = protective_mal_NN,
+                                                 Feature = names(protective_list)[j]))
+}
+
+stopCluster(cl)
+```
+
+```{r closeness_protect_PLOT}
+rnd_protective_vec_total2 <- rnd_protective_vec_total %>% 
+ left_join(., rnd_protective_p_results_total, by = "Feature") %>% 
+  mutate(new_feature = paste0(Feature, ", p-value: ", round(p, 3)))
+
+rnd_protective_vec_total$Feature <- factor(rnd_protective_vec_total$Feature,
+                                           levels = as.character(arrange(protective_mean_NN, mean)$Feature))
+
+prot.labs <- unique(rnd_protective_vec_total2$new_feature)
+names(prot.labs) <- unique(rnd_protective_vec_total2$Feature)
+
+
+PROTECTIVE_CLOSE_plot <- ggplot(data = rnd_protective_vec_total,
+                                aes(x = dist, group = Feature, fill = Feature)) +
+  geom_histogram(bins = 50) +
+  geom_vline(data = protective_mean_NN, aes(xintercept = mean), size = 2) +
+  scale_x_continuous(limits=c(0,3000), labels = seq(0,3000, 500), breaks = seq(0,3000, 500)) +
+  facet_wrap(~Feature, 
+             labeller = labeller(Feature = prot.labs),
+             ncol = 1, 
+             scales = "free_y") +
+  labs(x = paste0("Mean NN Distance (k = ",k_nearest_neighbors,")"),
+       title = "Protective factors closeness test",
+       subtitle = "If number of observations <= 15, k was set to 1",
+       caption = "Figure 3.9") +
+  scale_fill_viridis_d() +
+  plotTheme() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 11, family = "sans", face = "plain", hjust = 0),
+    strip.background = element_rect(fill = "white"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r crime_closeness_test}
+crime_risk_name <- var_list[["Crime_1718"]] %>%
+  mutate(OFFENSE = paste0("CRIME.1718_", OFFENSE)) %>% 
+  pull(OFFENSE) %>% 
+  unique()
+crime_vars <- var_list[crime_risk_name[crime_risk_name %in% names(var_list)]]
+names(crime_vars) <- c("THEFT F/AUTO", "BURGLARY", "THEFT/OTHER",
+                       "ASSAULT W/DANGEROUS WEAPON", "MOTOR VEHICLE THEFT", "ROBBERY",
+                       "SEX ABUSE", "HOMICIDE" )
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+
+rnd_crime_p_results_total <- NULL
+rnd_crime_vec_total <- NULL
+crime_mean_NN <- NULL
+k_nearest_neighbors <- 3
+for(j in seq_along(crime_vars)){
+  crime_desc <- crime_vars[[j]]
+  cat(names(crime_vars)[j], "\n")
+  crime_mal_NN <- nn_function(st_coordinates(crime_desc),
+                            st_coordinates(mal_dissolve), k)
+  crime_mal_NN <- mean(crime_mal_NN$value)
+  
+  
+  rnd_crime_results <- foreach(i = seq_len(simulations),
+                        .packages = c('sf', 'dplyr', 'FNN', 'tibble', 'tidyr'),
+                        .combine  = c) %dopar% { 
+    cat(i,"\n")
+     if(nrow(crime_desc) >= k){
+       crime_mal_NN_rnd <- sf::st_sample(mask_diss, nrow(crime_desc)) %>%
+         st_coordinates(.) %>%
+         nn_function(., st_coordinates(mal_dissolve), k_nearest_neighbors)
+     } else {
+       crime_mal_NN_rnd <- NA                    
+     }
+  }
+  #rnd_crime_p_results <- data.frame(p = map_dbl(rnd_crime_results, 
+   #                                           function(x) 1-ecdf(x)(crime_mal_NN)), 
+    #                              Feature = names(crime_vars)[j])
+  
+  rnd_crime_vec <- data.frame(dist = as.numeric(map_dbl(rnd_crime_results, mean)),
+                            Feature = names(crime_vars)[j])
+  rnd_crime_vec_total <- rbind(rnd_crime_vec_total, rnd_crime_vec)
+  
+  rnd_crime_p_results <- rnd_crime_vec %>% 
+    mutate(mean = crime_mal_NN) %>% 
+    filter(dist > mean) %>% 
+    summarise(count = n()) %>% 
+    mutate(diff = 1000 - count,
+           p = diff/count,
+           Feature = names(crime_vars)[j]) %>% 
+    dplyr::select(Feature, p)
+  
+  rnd_crime_p_results_total <- rbind(rnd_crime_p_results_total, rnd_crime_p_results)
+  
+  crime_mean_NN <- rbind(crime_mean_NN, data.frame(mean = crime_mal_NN, 
+                                                    Feature = names(crime_vars)[j]))
+}
+
+
+stopCluster(cl)
+```
+
+```{r closeness_crime_PLOT}
+rnd_crime_vec_total2 <- rnd_crime_vec_total %>% 
+ left_join(., rnd_crime_p_results_total, by = "Feature") %>% 
+  mutate_at(vars(Feature), str_to_title) %>% 
+  mutate(new_feature = paste0(Feature, ", p-value: ", round(p, 3)))
+
+rnd_crime_vec_total$Feature <- factor(rnd_crime_vec_total$Feature ,
+                                     levels = as.character(arrange(crime_mean_NN, mean)$Feature))
+
+crime.labs <- unique(rnd_crime_vec_total2$new_feature)
+names(crime.labs) <- unique(rnd_crime_vec_total$Feature)
+
+CRIME_CLOSE_plot <- ggplot(data = rnd_crime_vec_total, aes(x = dist, group = Feature, fill = Feature)) +
+  geom_histogram(bins = 50) +
+  geom_vline(data = crime_mean_NN, aes(xintercept = mean), size = 2) +
+  scale_x_continuous(limits=c(0,3000), labels = seq(0,3000, 500), breaks = seq(0,3000, 500)) +
+  facet_wrap(~Feature, 
+             labeller = labeller(Feature = crime.labs),
+             ncol = 1, 
+             scales = "free_y") +
+  labs(x = paste0("Mean NN Distance (k = ",k_nearest_neighbors,")"),
+       title = "Crime-related risk factors closeness test",
+       caption = "Figure 3.10") +
+  scale_fill_viridis_d() +
+  plotTheme() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 11, family = "sans", face = "plain", hjust = 0),
+    strip.background = element_rect(fill = "white"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r risk_closeness_test}
+business_risk_name <- var_list[["BusinessProject"]] %>%
+  filter(Category == "Risk") %>% 
+  mutate(SELECTED_SIC_DESC = paste0("BUSI_",SELECTED_SIC_DESC)) %>% 
+  pull(SELECTED_SIC_DESC) %>% 
+  unique()
+
+violations_risk_name <- var_list[["311_1718"]] %>%
+  mutate(SERVICECODEDESCRIPTION = paste0("VIO.1718_", SERVICECODEDESCRIPTION)) %>% 
+  pull(SERVICECODEDESCRIPTION) %>% 
+  unique()
+
+risk_class <- c("Check_Cashing", "BusStops", "NonDepository_Banks", "Liquor_Licenses", "Public_Housing")
+
+business_risk <- var_list[business_risk_name[business_risk_name %in% names(var_list)]]
+violations_risk <- var_list[violations_risk_name[violations_risk_name %in% names(var_list)]]
+resource_risk <- var_list[risk_class[risk_class %in% names(var_list)]]
+
+risk_list <- do.call(c, list(business_risk, resource_risk, violations_risk))
+names(risk_list) <- c("Laundromats", "Convenience Stores", "Hair/Nail Salons", "Check_Cashing",
+                      "Bus Stops", "NonDepository Banks", "Liquor Licenses", "Public Housing",
+                      "Sanitation Enforcement", "Illegal Dumping", "Abandoned Vehicle - On Public Property",
+                      "Abandoned Vehicle - On Private Property", "Grass and Weeds Mowing")
+
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+rnd_risk_p_results_total <- NULL
+rnd_risk_vec_total <- NULL
+risk_mean_NN <- NULL
+k_nearest_neighbors <- 3
+for(j in seq_along(risk_list)){
+  risk_desc <- risk_list[[j]]
+  cat(names(risk_list)[j], "\n")
+  risk_mal_NN <- nn_function(st_coordinates(risk_desc),
+                             st_coordinates(mal_dissolve), k_nearest_neighbors)
+  risk_mal_NN <- mean(risk_mal_NN$value)
+  
+  
+  rnd_risk_results <- foreach(i = seq_len(simulations),
+                              .packages = c('sf', 'dplyr', 'FNN', 'tibble', 'tidyr'),
+                              .combine  = c) %dopar% { 
+                                cat(i,"\n")
+                                if(nrow(risk_desc) >= k_nearest_neighbors){
+                                  risk_mal_NN_rnd <- sf::st_sample(mask_diss, nrow(risk_desc)) %>%
+                                    st_coordinates(.) %>%
+                                    nn_function(., st_coordinates(mal_dissolve), k_nearest_neighbors)
+                                } else {
+                                  risk_mal_NN_rnd <- NA                    
+                                }
+                              }
+  #rnd_risk_p_results <- data.frame(p = map_dbl(rnd_risk_results, 
+   #                                            function(x) 1-ecdf(x)(risk_mal_NN)), 
+    #                               Feature = names(risk_list)[j])
+  
+  rnd_risk_vec <- data.frame(dist = as.numeric(map_dbl(rnd_risk_results, mean)),
+                             Feature = names(risk_list)[j])
+  rnd_risk_vec_total <- rbind(rnd_risk_vec_total, rnd_risk_vec)
+  
+  rnd_risk_p_results <- rnd_risk_vec %>% 
+    mutate(mean = risk_mal_NN) %>% 
+    filter(dist > mean) %>% 
+    summarise(count = n()) %>% 
+    mutate(diff = 1000 - count,
+           p = diff/count,
+           Feature = names(risk_list)[j]) %>% 
+    dplyr::select(Feature, p)
+  
+  rnd_risk_p_results_total <- rbind(rnd_risk_p_results_total, rnd_risk_p_results)
+  
+  risk_mean_NN <- rbind(risk_mean_NN, data.frame(mean = risk_mal_NN, 
+                                                 Feature = names(risk_list)[j]))
+}
+
+stopCluster(cl)
+```
+
+```{r closeness_risk_PLOT}
+rnd_risk_vec_total2 <- rnd_risk_vec_total %>%
+  left_join(., rnd_risk_p_results_total, by = "Feature") %>% 
+  mutate(Feature = case_when(Feature == "Check_Cashing" ~ "Check Cashing", TRUE ~ as.character(Feature))) %>%
+  mutate(new_feature = paste0(Feature, ", p-value: ", round(p, 3)))
+
+rnd_risk_vec_total$Feature <- factor(rnd_risk_vec_total$Feature ,
+                                     levels = as.character(arrange(risk_mean_NN, mean)$Feature))
+
+risk.labs <- unique(rnd_risk_vec_total2$new_feature)
+names(risk.labs) <- unique(rnd_risk_vec_total$Feature)
+
+
+RISK_CLOSE_plot <- ggplot(data = rnd_risk_vec_total, aes(x = dist, group = Feature, fill = Feature)) +
+  geom_histogram(bins = 50) +
+  geom_vline(data = risk_mean_NN, aes(xintercept = mean), size = 2) +
+  scale_x_continuous(limits=c(0,3000), labels = seq(0,3000, 500), breaks = seq(0,3000, 500)) +
+  facet_wrap(~Feature, 
+             labeller = labeller(Feature = risk.labs),
+             ncol = 1, 
+             scales = "free_y") +
+  labs(x = paste0("Mean NN Distance (k = ",k_nearest_neighbors,")"),
+       title = "Risk factors closeness test",
+       caption = "Figure 3.11")  +
+  scale_fill_viridis_d(option = "D") +
+  plotTheme() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(size = 11, family = "sans", face = "plain", hjust = 0),
+    strip.background = element_rect(fill = "white"),
+    panel.grid.minor = element_blank()
+  )
+
+```
+
+```{r dataPrep}
+target_var <- "net_mal"
+
+#selecting census features and public housing feature created above
+other_select <- ALL_FEATURES_PH %>% 
+  dplyr::select("SF1_Housing units",
+                "SF1_Families Pop",
+                "SF1_Housing, rented",
+                "SF1_Houshold size",
+                "SF1_Housing, vacant",
+                "SF1_Pop, under 18y",
+                net_mal, mal_rate, net_pop, net_id) %>% 
+  replace(is.na(.), 0)
+
+# Join Risk and Protective features to selected other feaures to form data for regression models
+risk_prot_census_dat <- full_join(features_risk_strong, other_select, by = "net_id") %>%
+  full_join(., features_protective_strong, by = "net_id") %>% 
+  dplyr::select(-mal_rate, -net_pop, -net_mal1718.y,
+                -net_mal, -net_pop.y, -mal_rate.y, 
+                -net_pop.x, -mal_rate.x, 
+                -NN_ScreenedIn_1718.y) %>%   
+  rename(net_mal = net_mal1718.x,
+         NN_ScreenedIn = NN_ScreenedIn_1718.x)   %>%
+  dplyr::rename_all(funs(make.names(.))) #%>% 
+  #filter(net_mal <= 20)
+
+names(risk_prot_census_dat) <- str_remove_all(names(risk_prot_census_dat), ".1718")
+
+#three outlier grid cells: net id 2082, 2740, 2803
+#find mean count of maltreatment of queen neighbors and use that value
+net_DC2 <- net_DC %>% mutate(n = 1:nrow(.))
+
+qn_2082 <- st_relate(net_DC2 %>% filter(net_id == 2082), net_DC2, pattern = "F***T****")
+qn_2082_netid <- net_DC2 %>% filter(n %in% qn_2082[[1]]) %>% dplyr::select(net_id)
+qn_2082_mean <- risk_prot_census_dat %>% filter(net_id %in% qn_2082_netid$net_id) %>% dplyr::select(net_id, net_mal)
+qn_2082_mean <- round(mean(qn_2082_mean$net_mal))
+
+qn_2740 <- st_relate(net_DC2 %>% filter(net_id == 2740), net_DC2, pattern = "F***T****")
+qn_2740_netid <- net_DC2 %>% filter(n %in% qn_2740[[1]]) %>% dplyr::select(net_id)
+qn_2740_mean <- risk_prot_census_dat %>% filter(net_id %in% qn_2740_netid$net_id) %>% dplyr::select(net_id, net_mal)
+qn_2740_mean <- round(mean(qn_2740_mean$net_mal))
+
+qn_2803 <- st_relate(net_DC2 %>% filter(net_id == 2803), net_DC2, pattern = "F***T****")
+qn_2803_netid <- net_DC2 %>% filter(n %in% qn_2803[[1]]) %>% dplyr::select(net_id)
+qn_2803_mean <- risk_prot_census_dat %>% filter(net_id %in% qn_2803_netid$net_id) %>% dplyr::select(net_id, net_mal)
+qn_2803_mean <- round(mean(qn_2803_mean$net_mal))
+
+risk_prot_census_dat <- risk_prot_census_dat %>% 
+  mutate(net_mal = case_when(net_id == 2082 ~ qn_2082_mean,
+                             net_id == 2740 ~ qn_2740_mean,
+                             net_id == 2803 ~ qn_2803_mean,
+                             TRUE ~ as.numeric(net_mal)))
+
+dat <- risk_prot_census_dat %>% 
+  dplyr::select(-net_id) %>%
+  mutate_at(vars(-net_mal), scale_this) %>%  
+  identity()
+
+listw <- nb2listw(poly2nb(as(net_DC, "Spatial"), queen = TRUE), zero.policy=TRUE)
+
+#net_hood <- subset(net_hood, net_id %in% risk_prot_census_dat$net_id)
+
+#listw <- nb2listw(poly2nb(as(risk_prot_census_dat %>% 
+ #                              left_join(., net_DC, by = "net_id") %>% 
+  #                             st_sf(), "Spatial"), queen = TRUE), zero.policy=TRUE)
+
+# Add neighborhood name
+all.equal(net_hood$net_id, risk_prot_census_dat$net_id) #TRUE
+risk_prot_census_dat$.block_id <- net_hood$NAME
+```
+
+```{r neighborhood_fixed_effects}
+hood_matrix <- model.matrix(net_mal ~ .block_id, risk_prot_census_dat)
+hood_model <- lm(sqrt(risk_prot_census_dat$net_mal) ~ hood_matrix)
+dat$hood_fixed <- predict(hood_model, type = "response")^2
+risk_prot_census_dat$hood_fixed <- predict(hood_model, type = "response")^2
+
+```
+
+```{r cv_fold_tbl}
+# Create CV neighborhood fold index
+all_hoods <- length(unique(net_hood$NAME))
+n_folds = ifelse(n_folds == "LOOCV", all_hoods, n_folds)
+folds_index <- groupdata2::fold(risk_prot_census_dat, k = n_folds, id_col = '.block_id')$.folds
+# create tibble with all CV folds and assocaited data
+cv_tbl <- tibble(folds = seq_len(n_folds),
+                 train = NA, train_y = NA, train_index = NA, train_net_id = NA,
+                 test  = NA, test_y  = NA, test_index  = NA, test_net_id  = NA)
+for(k in seq_len(n_folds)){
+  fold_i  <- which(folds_index == k)
+  cv_tbl[k,]$train         <- list(dat[-fold_i,])
+  cv_tbl[k,]$test          <- list(dat[ fold_i,])
+  cv_tbl[k,]$train_y       <- list(risk_prot_census_dat[-fold_i,target_var])
+  cv_tbl[k,]$test_y        <- list(risk_prot_census_dat[ fold_i,target_var])
+  cv_tbl[k,]$train_index   <- list(setdiff(seq(1:nrow(dat)),fold_i))
+  cv_tbl[k,]$test_index    <- list(fold_i)
+  cv_tbl[k,]$train_net_id  <- list(risk_prot_census_dat[-fold_i,"net_id"])
+  cv_tbl[k,]$test_net_id   <- list(risk_prot_census_dat[ fold_i,"net_id"])
+}
+
+```
+
+```{r Poisson_Reg}
+po_cv_tbl <- cv_tbl %>%
+  mutate(fit = map(train, glm_fit, 
+               formula =  paste("net_mal ~ ."), 
+               family = "poisson"),
+         pred = map2(fit, test, lm_predict, sqrt = FALSE),
+         mdl_nam = "GLM - Poisson") %>% 
+  score_model()
+cat("Test Set MAE:",mean(po_cv_tbl$MAE),"\n")
+cat("Test Set logdev:",mean(po_cv_tbl$logdev, na.rm=TRUE),"\n")
+
+```
+
+```{r RF_Reg}
+rf_cv_tbl <- cv_tbl %>%
+    mutate(fit   = map(train, rf_fit, formula = "net_mal ~ .", mtry_add = 2, importance = "impurity"),
+           pred  = map2(fit, test, lm_predict),
+           mdl_nam = "Random Forest"
+           ) %>% 
+    score_model()
+cat("Test Set MAE:",mean(rf_cv_tbl$MAE),"\n")
+cat("Test Set logdev:",mean(rf_cv_tbl$logdev, na.rm=TRUE),"\n")
+
+```
+
+```{r RF_Var_Importance}
+varimp_dat <- data.frame(importance = rf_cv_tbl$fit[[1]]$variable.importance) %>% 
+  rownames_to_column("variable")
+
+RF_VARIMP_PLOT <- ggplot(varimp_dat, aes(x=reorder(variable,importance), y=importance, fill=importance))+ 
+      geom_bar(stat="identity", position="dodge")+ coord_flip()+
+      labs(y = "Variable Importance",
+           x = " ", 
+           title = "Feature importance",
+           subtitle = "Random Forest sub-model",
+           caption = "Figure 4.8") +
+      guides(fill=F)+
+      scale_fill_viridis_c() +
+      plotTheme()
+
+```
+
+```{r SpatialDurbin_Reg}
+spat_durbin <- errorsarlm(sqrt(net_mal) ~ ., data = dat, listw, etype ="emixed")
+spat_durbin_tbl <- tibble(
+  fit   = list(spat_durbin),
+  pred  = map(fit, sar_pred),
+  test_y= list(dat$net_mal),
+  test_net_id = list(risk_prot_census_dat$net_id),
+  mdl_nam = "Spatial Durbin - sqrt") %>% 
+  score_model()
+cat("Test Set MAE:",mean(spat_durbin_tbl$MAE),"\n")
+cat("Test Set logdev:",mean(spat_durbin_tbl$logdev, na.rm=TRUE),"\n")
+
+```
+
+```{r subModel_Fit_PLOTS}
+POISSON_REGRESSION_FIT_plot <- plot_fold_pred(po_cv_tbl$pred, po_cv_tbl$test_y, type = "fit", "Poisson Regresion")
+RANDOM_FOREST_FIT_plot <- plot_fold_pred(rf_cv_tbl$pred, rf_cv_tbl$test_y, type = "fit", "Random Forest")
+SPATIAL_ERROR_FIT_plot <- plot_fold_pred(spat_durbin_tbl$pred, dat$net_mal, type = "fit", "Spatial Durbin Model")
+submodel_fit_PLOTS <- cowplot::plot_grid(POISSON_REGRESSION_FIT_plot + labs(caption = "Figure 4.1"), 
+                                         RANDOM_FOREST_FIT_plot, 
+                                         SPATIAL_ERROR_FIT_plot,
+                                         ncol = 3, align = "hv", axis = "lrbt")
+```
+
+```{r gather_submodel_preds}
+po_pred_dat <- po_cv_tbl %>%
+  unnest(pred) %>%
+  mutate(test_y = po_cv_tbl %>% unnest(test_y) %>% pull(test_y),
+         test_net_id = po_cv_tbl %>% unnest(test_net_id) %>% pull(test_net_id))
+
+po_pred_geoplot <- model_pred_geoplot(po_pred_dat$pred,
+                                      po_pred_dat$test_y,
+                                      po_pred_dat$test_net_id,
+                                      net_DC, base_map, "po")
+
+rf_pred_dat <- rf_cv_tbl %>%
+  unnest(pred) %>%
+  mutate(test_y = rf_cv_tbl %>% unnest(test_y) %>% pull(test_y),
+         test_net_id = rf_cv_tbl %>% unnest(test_net_id) %>% pull(test_net_id))
+
+rf_pred_geoplot <- model_pred_geoplot(rf_pred_dat$pred,
+                                      rf_pred_dat$test_y,
+                                      rf_pred_dat$test_net_id,
+                                      net_DC, base_map,
+                                      "Random Forest")
+
+sarlm_pred_dat <- spat_durbin_tbl %>%
+  unnest(pred) %>%
+  mutate(test_y = spat_durbin_tbl %>% unnest(test_y) %>% pull(test_y),
+         test_net_id = spat_durbin_tbl %>% unnest(test_net_id) %>% pull(test_net_id))
+
+sarlm_pred_geoplot <- model_pred_geoplot(sarlm_pred_dat$pred,
+                                         sarlm_pred_dat$test_y,
+                                         sarlm_pred_dat$test_net_id,
+                                         net_DC, base_map,
+                                         "SARLM")
+
+```
+
+```{r join_submodel_predictions}
+
+mal_preds <- risk_prot_census_dat %>% 
+  dplyr::select(net_id, net_mal) %>% 
+  left_join(., dplyr::select(po_pred_dat,
+                             net_id = test_net_id,
+                             pred_lm = pred), by = "net_id") %>%
+  left_join(., dplyr::select(rf_pred_dat, 
+                             net_id = test_net_id,
+                             pred_rf = pred), by = "net_id") %>% 
+  left_join(., dplyr::select(sarlm_pred_dat, 
+                             net_id = test_net_id,
+                             pred_sarlm = pred), by = "net_id") %>% 
+  mutate_if(is.double, round, 2)
+```
+
+```{r meta_model}
+if(all.equal(mal_preds$net_id, net_hood$net_id)){
+  cat("Predictions and spatial data are in same order, GOOD to go!", "\n")
+} else {
+  cat("There is a PROBLEM with order of predictions and spatial data; Likely Errors!","\n")
+}
+
+mal_preds_cv_dat <- dplyr::select(mal_preds, -net_id)
+ens_cv_tbl <- tibble(folds = seq_len(n_folds),
+                 train = NA, train_y = NA, train_index = NA, train_net_id = NA,
+                 test  = NA, test_y  = NA, test_index  = NA, test_net_id  = NA)
+for(k in seq_len(n_folds)){
+  fold_i  <- which(folds_index == k)
+  ens_cv_tbl[k,]$train         <- list(mal_preds_cv_dat[-fold_i,])
+  ens_cv_tbl[k,]$test          <- list(mal_preds_cv_dat[ fold_i,])
+  ens_cv_tbl[k,]$train_y       <- list(mal_preds_cv_dat[-fold_i,target_var])
+  ens_cv_tbl[k,]$test_y        <- list(mal_preds_cv_dat[ fold_i,target_var])
+  ens_cv_tbl[k,]$train_index   <- list(setdiff(seq(1:nrow(mal_preds_cv_dat)),fold_i))
+  ens_cv_tbl[k,]$test_index    <- list(fold_i)
+  ens_cv_tbl[k,]$train_net_id  <- list(mal_preds[-fold_i,"net_id"])
+  ens_cv_tbl[k,]$test_net_id   <- list(mal_preds[ fold_i,"net_id"])
+}
+
+ens_cv_tbl <- ens_cv_tbl %>%
+  mutate(fit   = map(train, rf_fit, formula = "net_mal ~ pred_lm + pred_rf + pred_sarlm"),
+         pred  = map2(fit, test, lm_predict),
+         # pred  = map(pred, round),
+         mdl_nam = "Meta-Model") %>% 
+  score_model()
+
+cat("Test Set MAE:",mean(ens_cv_tbl$MAE),"\n")
+cat("Test Set logdev:",mean(ens_cv_tbl$logdev),"\n")
+
+```
+
+```{r meta_model_fit_plot}
+META_MODEL_FIT_plot <- plot_fold_pred(ens_cv_tbl$pred, ens_cv_tbl$test_y, type = "fit", " ") +
+  labs(x = "Observed Maltreatment Counts",
+       y = "Predicted Maltreatment Counts",
+       title = "Predicted vs. observed maltreatment counts",
+       subtitle = "Meta-Model",
+       caption = "Figure 4.2") +
+  plotTheme()
+```
+
+```{r joining_metamodel_predictions}
+ens_pred_dat <- ens_cv_tbl %>% 
+  unnest(pred) %>% 
+  mutate(test_y = ens_cv_tbl %>% unnest(test_y) %>% pull(test_y),
+         test_net_id = ens_cv_tbl %>% unnest(test_net_id) %>% pull(test_net_id)) 
+
+ens_pred_geoplot <- model_pred_geoplot(ens_pred_dat$pred, 
+                                       ens_pred_dat$test_y, 
+                                       ens_pred_dat$test_net_id,
+                                       net_DC, base_map, 
+                                       "Meta-Model")
+mal_preds2 <- mal_preds %>% 
+  left_join(., dplyr::select(ens_pred_dat, 
+                             net_id = test_net_id,
+                             pred_ens = pred) %>% 
+              mutate(pred_ens = round(pred_ens,2)), by = "net_id")
+
+```
+
+```{r model_table}
+models <- bind_rows(rf_cv_tbl, spat_durbin_tbl, ens_cv_tbl, po_cv_tbl)
+model_results <- models %>%
+  dplyr::select("Model Name" = mdl_nam, R2, RMSE, MAE, logdev) %>%
+  group_by(`Model Name`) %>%
+  arrange(`Model Name`) %>%
+  summarise(R2_mean      = mean(R2, na.rm=TRUE),
+            R2_sd        = sd(R2, na.rm=TRUE),
+            MAE_mean     = mean(MAE, na.rm=TRUE),
+            MAE_sd       = sd(MAE, na.rm=TRUE),
+            RMSE_mean    = mean(RMSE, na.rm=TRUE),
+            RMSE_sd      = sd(RMSE, na.rm=TRUE),
+            logdev_mean  = mean(logdev, na.rm=TRUE),
+            logdev_sd    = sd(logdev, na.rm=TRUE)) 
+Model_Error_Results_table <- model_results %>%
+  kable(., format = "html", digits = 3) %>%
+  kable_styling()
+```
+
+```{r PREDICTION_MAP_plots}
+POISSON_MODEL_PREDICTION_MAP_plot <- cowplot::plot_grid(po_pred_geoplot[[2]] +
+                                                          labs(title = "Poisson Regression",
+                                                               subtitle = "Predicted Maltreatment Count"),
+                                                        po_pred_geoplot[[1]] +
+                                                          labs(subtitle = "MAE"), align = "hv", axis = "lrbt")
+RF_MODEL_PREDICTION_MAP_plot <- cowplot::plot_grid(rf_pred_geoplot[[2]] +
+                                                     labs(title = "Random Forest",
+                                                          subtitle = "Predicted Maltreatment Count"), 
+                                                   rf_pred_geoplot[[1]] + 
+                                                     labs(subtitle = "MAE"), align = "hv", axis = "lrbt")
+SARLM_MODEL_PREDICTION_MAP_plot <- cowplot::plot_grid(sarlm_pred_geoplot[[2]] + 
+                                                        labs(title = "Spatial Durbin Model",
+                                                             subtitle = "Predicted Maltreatment Count"), 
+                                                      sarlm_pred_geoplot[[1]] + 
+                                                        labs(subtitle = "MAE"), align = "hv", axis = "lrbt")
+META_MODEL_PREDICTION_MAP_plot <- cowplot::plot_grid(ens_pred_geoplot[[2]] + 
+                                                       labs(title = "Meta-Model",
+                                                            subtitle = "Predicted Maltreatment Count",
+                                                            caption = "Figure 4.3"), 
+                                                     ens_pred_geoplot[[1]] + 
+                                                       labs(subtitle = "MAE"), align = "hv", axis = "lrbt")
+```
+
+```{r mask_metamodel_errormap}
+ens_pred_geoplot_mask <- model_pred_geoplot(ens_pred_dat$pred, 
+                                       ens_pred_dat$test_y, 
+                                       ens_pred_dat$test_net_id,
+                                       net_mask, base_map, 
+                                       "Meta-Model")
+
+metamodel_error_plot_mask <- cowplot::plot_grid(ens_pred_geoplot_mask[[2]] + 
+                                                       labs(title = "Meta-Model",
+                                                            subtitle = "Predicted Maltreatment Count",
+                                                            caption = "Figure 4.4"), 
+                                                     ens_pred_geoplot_mask[[1]] + 
+                                                       labs(subtitle = "MAE"), align = "h")
+
+```
+
+```{r model_error_by_neighborhood}
+error_geoplot <-  net_DC %>%
+  left_join(., ens_pred_dat, by = c("net_id" = "test_net_id"),
+            feature_name = paste0("Meta-Model", "dev")) %>%
+  score_model()
+
+# error metrics to points
+error_points <- st_centroid(error_geoplot) %>%
+  dplyr::select(MAE, test_y)
+
+# aggreate mean errors to neighborhoods
+neighborhood_metric_MAE<- error_points %>%
+  aggregate(., nbr, mean) %>%
+  dplyr::select(MAE) %>% 
+  mutate(MAE = round(MAE,2),
+         cuts = case_when(MAE == 0 ~ "0", 
+                          MAE > 0 & MAE < 0.5 ~ "0.1 to 0.49",
+                          MAE >= 0.5 & MAE < 1 ~ "0.5 to 0.99",
+                          MAE >= 1 & MAE < 3 ~ "1 to 2.99",
+                          MAE >= 3 ~ "3+")) #%>% 
+  #make_cuts(., "MAE")
+
+MAE_BY_NEIGHBORHOOD_plot <- make_fishnet_dist_plot(neighborhood_metric_MAE, base_map, 
+                       direction = 1, var_name = "MAE") +
+  geom_sf(data = ll(nbr), color = "black", fill = NA, inherit.aes = F, size = .5, alpha = .8) +
+  labs(title = "Out-of-Fold error by neighborhood",
+       subtitle = "MAE",
+       caption = "Figure 4.5") 
+```
+
+```{r globalMorans}
+#matrix of coordinates
+nbrCoords <- neighborhood_metric_MAE %>% 
+  st_centroid() %>% 
+  mutate(X = st_coordinates(.)[,1],
+         Y = st_coordinates(.)[,2]) %>% 
+  as.data.frame() %>% 
+  dplyr::select(X, Y) %>% 
+  as.matrix()
+  
+
+#make weights for test - neighborhood level
+neighborNbrs <- knn2nb(knearneigh(nbrCoords, 5))
+spatialWeights <- nb2listw(neighborNbrs, style="W")
+
+moranTest_MAE <- moran.mc(neighborhood_metric_MAE$MAE, spatialWeights, nsim = 999)
+```
+
+```{r ACS_download}
+tract10 <- get_acs(geography = "tract", variables = c("B02001_001","B02001_002E","B17001_002"), 
+          year = 2010, state=11, county=001, geometry=T)
+
+tract10 <- tract10 %>%
+  dplyr::select(variable,estimate) %>%
+  as.data.frame() %>%
+  spread(variable,estimate) %>%
+  rename(TotalPop=B02001_001,
+         NumberWhites=B02001_002,
+         TotalPoverty=B17001_002) %>%
+  mutate(percentNonWhite = ifelse(TotalPop > 0, ((TotalPop - NumberWhites) / TotalPop),0),
+         percentPoverty  = ifelse(TotalPop > 0, TotalPoverty / TotalPop, 0),
+         tract_id        = row_number()) %>%
+  st_sf() %>%
+  st_transform(102685) 
+tract10$tract_area <- st_area(tract10)
+```
+
+```{r ACS_nbr_intersection}
+#intersect neighborhoods and census tracts
+nbr_tract_intersect <- st_intersection(tract10, nbr)
+nbr_tract.spJoin <- nbr_tract_intersect %>% 
+  #calculate area
+  mutate(intersect_area = st_area(nbr_tract_intersect)) %>% 
+  # get % of tract and multiply totals by percent area of tract in statarea
+  group_by(tract_id) %>% 
+  mutate(intersect_pcnt_of_tract = as.numeric(intersect_area) / as.numeric(tract_area),
+         intersect_TotalPop = round(TotalPop * intersect_pcnt_of_tract, 1),
+         intersect_NumberWhites = round(NumberWhites * intersect_pcnt_of_tract, 1),
+         intersect_TotalPoverty = round(TotalPoverty * intersect_pcnt_of_tract, 1)) %>%
+  ungroup() %>% 
+  # sum the fraction of pop totals up to statarea
+  group_by(NAME) %>%
+  summarise(nbr_TotalPop = sum(intersect_TotalPop),
+            nbr_NumberWhites = sum(intersect_NumberWhites),
+            nbr_TotalPoverty = sum(intersect_TotalPoverty)) %>% 
+  # make quantites of interest
+  mutate(percentNonWhite = ifelse(nbr_TotalPop > 0, 
+                                  ((nbr_TotalPop - nbr_NumberWhites) / nbr_TotalPop),0),
+         percentPoverty = ifelse(nbr_TotalPop > 0, 
+                                 nbr_TotalPoverty / nbr_TotalPop, 0))
+
+# classify by quantile and make dummy variable
+nbr_tract.spJoin <- nbr_tract.spJoin %>% 
+  mutate(poverty.percentile = ifelse(percentPoverty >=
+                                         quantile(nbr_tract.spJoin$percentPoverty, 
+                                                  p = stat_area_quantile, na.rm=T),"1",0),
+         nonWhite.percentile = ifelse(percentNonWhite >=
+                                          quantile(nbr_tract.spJoin$percentNonWhite, 
+                                                   p = stat_area_quantile, na.rm=T),1,0))
+```
+
+```{r typo_comparison}
+# aggregate sum of maltreatment incidents to nbr
+nbr_mal <- error_points %>%
+  aggregate(., nbr_tract.spJoin, sum) %>%
+  dplyr::select(test_y)
+nbr_MAE <- error_points %>%
+  aggregate(., nbr_tract.spJoin, mean) %>%
+  dplyr::select(MAE) %>% 
+  mutate(MAE = round(MAE, 3),
+         cuts = case_when(MAE == 0 ~ "0", 
+                          MAE > 0 & MAE < 0.5 ~ "0.1 to 0.49",
+                          MAE >= 0.5 & MAE < 1 ~ "0.5 to 0.99",
+                          MAE >= 1 & MAE < 3 ~ "1 to 2.99",
+                          MAE >= 3 ~ "3+"))
+#join together
+nbr_errors <- nbr_tract.spJoin %>% 
+  st_join(., nbr_mal, join = st_equals) %>% 
+  st_join(., nbr_MAE, join = st_equals)
+
+# group by poverty
+poverty_aggregate <- nbr_errors %>% 
+  group_by(poverty.percentile) %>% 
+  summarise(#med_dev = round(median(logdev),3),
+            med_MAE = round(median(MAE),3),
+            med_mal = sum(test_y),
+            mean_mal = mean(test_y)) %>% 
+  #st_drop_geometry() %>% 
+  mutate(poverty.percentile = ifelse(poverty.percentile == 0, "Low", "High"),
+         type = "poverty") %>% 
+  rename(class = poverty.percentile) %>% 
+  dplyr::select(class, med_MAE, med_mal, mean_mal, type)
+
+# group by nonwhite
+nonwhite_aggregate <- nbr_errors %>% 
+  group_by(nonWhite.percentile) %>% 
+  summarise(#med_dev = round(median(logdev),3),
+            med_MAE = round(median(MAE),3),
+            med_mal = sum(test_y),
+            mean_mal = mean(test_y)) %>% 
+  #st_drop_geometry() %>% 
+  mutate(nonWhite.percentile = ifelse(nonWhite.percentile == 0, "Low", "High"),
+         type = "nonwhite") %>% 
+  rename(class = nonWhite.percentile) %>% 
+  dplyr::select(class, med_MAE, med_mal, mean_mal, type)
+
+typo_compare <- rbind(poverty_aggregate, nonwhite_aggregate)
+typo_compare_PLOT <- ggplot(typo_compare, aes(x = type, y = med_MAE, fill = class)) + 
+    geom_bar(position="dodge", stat="identity", width = .5) +
+    scale_y_continuous(limits=c(0,3)) +
+    scale_fill_viridis_d(option = "D") +
+    labs(title = "Neighborhood typology comparison",
+         x = "Typology",
+         y = "MAE",
+         caption = "Figure 4.7") +
+    plotTheme()
+
+typo_scatterPLOT <- ggplot(nbr_errors) +
+  geom_point(aes(x = test_y, y = MAE, color = factor(nonWhite.percentile))) +
+  geom_smooth(aes(x = test_y, y = MAE, color = factor(nonWhite.percentile)), method = "lm", se = FALSE) +
+  scale_y_continuous(limits=c(0,3)) +
+  scale_color_viridis_d(option = "D",
+                        name = " ",
+                        labels = c("majority white", "majority non-white")) +
+  labs(x = "Count of maltreatment events",
+  y = "MAE",
+  title = "Error rate by count of observed events") +
+  plotTheme()
+
+typoMAPS <- ggmap(base_map) + 
+  geom_sf(data = ll(typo_compare), aes(fill = class), inherit.aes = FALSE, alpha = 0.8) + 
+  geom_sf(data = ll(nbr), color = "black", fill = NA, inherit.aes = FALSE, alpha = 0.8, size = 0.5) +
+  facet_wrap(~type) +
+  scale_fill_viridis_d(option = "D", name = " ") +
+  labs(title = "Typology breakdown for comparison analysis",
+       caption = "Figure 4.6") +
+  mapTheme()  +
+  theme(
+    strip.text = element_text(size = 11, family = "sans", face = "plain", hjust = 0),
+    strip.background = element_rect(fill = "white"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r kde_model_comparison}
+error_geoplot_mask <-  net_mask %>%
+  left_join(., ens_pred_dat, by = c("net_id" = "test_net_id"),
+            feature_name = paste0("Meta-Model", "dev")) %>%
+  score_model()
+
+error_geoplot_mask$pred_bin_class <- bin_class(error_geoplot_mask, "pred")
+
+p.summ <- error_geoplot_mask %>%
+  group_by(pred_bin_class) %>%
+  dplyr::summarize(obs.total = sum(test_y),
+                   obs.cnt = n()) %>% 
+  rename(sens_group = pred_bin_class) %>%
+  filter(!is.na(sens_group)) %>%
+  identity()
+
+
+
+mal_ppp <- as.ppp(st_coordinates(var_list[["ScreenedIn_1718"]]), W = st_bbox(net_mask))
+mal_KDE <- spatstat::density.ppp(mal_ppp)
+
+mal_KDE_tbl <- as.data.frame(mal_KDE) %>%
+  st_as_sf(coords = c("x", "y"), crs = 102685) %>%
+  aggregate(., net_mask, mean) %>%
+  mutate(net_id = net_mask$net_id)
+
+if(all.equal(error_geoplot_mask$net_id, mal_KDE_tbl$net_id)){
+  cat("Good to go!")
+} else {
+  cat("Join will be an error, Net_id index does not match")
+}
+
+error_geoplot_mask$kde_bin_class  <- bin_class(mal_KDE_tbl, "value")
+
+kde.summ <- error_geoplot_mask %>%
+  group_by(kde_bin_class) %>%
+  dplyr::summarize(kde.total = sum(test_y),
+                   kde.cnt = n()) %>% 
+  rename(sens_group = kde_bin_class) %>%
+  filter(!is.na(sens_group)) %>%
+  identity()
+
+points.2019 <- var_list[["ScreenedIn_19"]] %>% 
+  filter(!(ID %in% .[st_union(mask),]$ID))
+
+#capturing 2019 points 
+agg2019Points <- aggregate(points.2019 %>% mutate(counter = 1) %>% dplyr::select(counter), error_geoplot_mask, sum) %>%
+  replace(is.na(.), 0) %>% 
+  rownames_to_column("row_id") %>% 
+  left_join(., error_geoplot_mask %>% rownames_to_column("row_id") %>% as.data.frame(), by = "row_id") %>% 
+  dplyr::select(-geometry.x) %>% 
+  rename(geometry = geometry.y)
+
+kde.summ.2019 <- agg2019Points %>% 
+  group_by(kde_bin_class) %>%
+  dplyr::summarize(kde.total = sum(counter),
+                   kde.cnt = n()) %>% 
+  rename(sens_group = kde_bin_class) %>%
+  filter(!is.na(sens_group)) %>%
+  identity()
+
+p.summ.2019 <- agg2019Points %>% 
+  group_by(pred_bin_class) %>%
+  dplyr::summarize(obs.total = sum(counter),
+                   obs.cnt = n()) %>% 
+  rename(sens_group = pred_bin_class) %>%
+  filter(!is.na(sens_group)) %>%
+  identity()
+```
+
+```{r risk_category_maps}
+KDE_PLOT <- ggmap(base_map) +
+  geom_sf(data = ll(kde.summ), aes(fill = factor(sens_group)), 
+          color = NA, alpha = 0.85, inherit.aes = FALSE) +
+  geom_sf(data = st_jitter(ll(st_difference(points.2019) %>% 
+                                .[bind_cols(error_geoplot,
+                                            aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                    filter(counter != 1),]), 0.0025), 
+   inherit.aes = FALSE, size = 0.75)  +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1,
+                       name = "Risk\nCategory") +
+  labs(title = "Risk categories from KDE overlaid with 2019 Screened In Cases",
+       subtitle = "Privacy Controls: Maltreatment events in grid cells with 1 point\nare masked; Remaining event locations are offset at random.",
+       caption = "Figure 4.9",
+       x = " ", 
+       y = " ") +
+  mapTheme()
+  #theme(
+   # axis.text = element_text(colour = "white"),
+    #axis.ticks = element_blank(),
+    #axis.line = element_blank()
+  #)
+
+PREDICTIONS_PLOT <- ggmap(base_map) +
+  geom_sf(data = ll(p.summ), aes(fill = factor(sens_group)), 
+          color = NA, alpha = 0.85, inherit.aes = FALSE) +
+  geom_sf(data = st_jitter(ll(st_difference(points.2019) %>% 
+                                .[bind_cols(error_geoplot,
+                                            aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                    filter(counter != 1),]), 0.0025), 
+   inherit.aes = FALSE, size = 0.75) +
+  scale_fill_viridis_d(na.value = NA, option = "D", direction = 1,
+                       name = "Risk\nCategory") +
+  labs(title = "Risk categories from meta-model overlaid with 2019 Screened In Cases",
+       x = " ", 
+       y = " ") +
+  mapTheme()
+  #theme(
+   # axis.text = element_text(colour = "white"),
+    #axis.ticks = element_blank(),
+    #axis.line = element_blank()
+  #)
+```
+
+```{r risk_category_plot}
+countComparisons <- merge(st_drop_geometry(p.summ), st_drop_geometry(kde.summ)) %>%
+  mutate_if(is.double, round, 3) %>% 
+  mutate(Category = rev(c("90% - 100%", "70% - 89%", "50% - 69%", 
+                      "30% - 49%", "1% - 29%"))) %>%
+  dplyr::mutate(kernelPct = round(kde.total / sum(kde.total),4),
+                fittedPct = round(obs.total / sum(obs.total), 4))
+
+countComparisonsLong <- countComparisons %>% 
+  gather(Variable, Value, kernelPct:fittedPct)
+
+#2019
+countComparisons.2019 <- merge(st_drop_geometry(p.summ.2019), st_drop_geometry(kde.summ.2019)) %>%
+  mutate_if(is.double, round, 3) %>% 
+  mutate(Category = rev(c("90% - 100%", "70% - 89%", "50% - 69%", 
+                      "30% - 49%", "1% - 29%"))) %>%
+  dplyr::mutate(kernelPct = round(kde.total / sum(kde.total),4),
+                fittedPct = round(obs.total / sum(obs.total), 4))
+
+countComparisonsLong.2019 <- countComparisons.2019 %>% 
+  gather(Variable, Value, kernelPct:fittedPct)
+
+RELATIVE_RISK_BARPLOT_COMPARE_plot <- ggplot(data=countComparisonsLong.2019, aes(Category,Value)) +
+  geom_bar(aes(fill = Variable), position = "dodge", stat="identity", color = NA) +
+  scale_y_continuous(limits = c(0, .6)) +
+  scale_fill_viridis_d(name = " ",
+                       labels=c("Meta-model", "Kernel Density")) +
+  labs(x= "Predicted Risk Levels",
+       y="Percent of 2019 Maltreatment Events",
+       title= "Goodness of fit: Spatial risk model vs. Kernel Density",
+       caption = "Figure 4.10") +
+  plotTheme() 
+```
+
+```{r alignPhase}
+# read in data --------------
+removals <- read.csv("C:/projects/PAP_Wash_DC/2019_11_11_dataFrom_DC/Align_Data/removals.csv") %>%
+      filter(!is.na(X) | !is.na(Y)) %>% 
+  filter_at(vars(contains("RP")), ~ . == "FY 2019")  %>%
+      st_as_sf(., coords = c("Y", "X"), crs = 4326) %>% 
+      st_transform(102685) %>% 
+      .[st_union(nbr),]
+
+fosterCares <- read.csv("C:/projects/PAP_Wash_DC/2019_11_11_dataFrom_DC/Align_Data/fosterHomes_2019.csv") %>%
+      filter(!is.na(X) | !is.na(Y)) %>%
+      st_as_sf(., coords = c("Y", "X"), crs = 4326) %>% 
+      st_transform(102685) %>% 
+      .[st_union(nbr),]
+
+altResp <- read.csv("C:/projects/PAP_Wash_DC/2019_11_11_dataFrom_DC/Align_Data/altResponse.csv") %>%
+      filter(!is.na(X) | !is.na(Y),
+             REPORTING_PERIOD == "FY 2019") %>%
+      st_as_sf(., coords = c("Y", "X"), crs = 4326) %>% 
+      st_transform(102685) %>% 
+      .[st_union(nbr),]
+
+# geocoded with tidygeocoder
+#read.csv("collab_familiesfirst_locations.csv") %>% 
+  #mutate(addr = as.character(paste0(address," ", zipcode))) %>% 
+  #as_tibble() %>% 
+  #geocode(addr)
+# one collaboration location did not geocode - returned NAs
+# filtering out "Far Southeast Family Strengthening Collaborative"
+
+collab_familiesFirst <- read.csv("C:/projects/PAP_Wash_DC/2019_11_11_dataFrom_DC/Align_Data/collab_familiesfirst_locations_geocode.csv") %>% 
+  filter(!(is.na(lat) | is.na(long))) %>% 
+  st_as_sf(., coords = c("long", "lat"), crs = 4326) %>%
+  st_transform(102685)
+
+source('C:/projects/PAP_Wash_DC/source_files/SchoolData.R', echo = TRUE, keep.source = TRUE)
+elem_catch  <- st_read("https://opendata.arcgis.com/datasets/dddddabc2ae24acc82f756c76b81d2ec_19.geojson") %>% 
+  st_transform(102685)
+schools_join <- left_join(elem_catch , starData, by = "GIS_ID") %>%
+    mutate(Framework.STAR.Rating = ifelse(is.na(Framework.STAR.Rating), "Missing Data", Framework.STAR.Rating ),
+           Accountability.Framework = as.character(Accountability.Framework),
+           Accountability.Framework = ifelse(is.na(Accountability.Framework), "Missing Data", Accountability.Framework)) %>% 
+    filter(Accountability.Framework != "Middle School")
+
+# population per risk category -----------
+popID <- ALL_FEATURES %>% 
+  dplyr::select(net_id, net_pop) %>% 
+  as.data.frame()
+
+binID <- error_geoplot_mask %>% 
+  dplyr::select(net_id, pred_bin_class) %>% 
+  as.data.frame()
+
+popBin <- left_join(binID, popID, by = "net_id") %>% 
+  na.omit() %>% 
+  group_by(pred_bin_class) %>% 
+  summarise(sumPop = sum(net_pop)) %>%
+  mutate(pctPop = sumPop/sum(sumPop),
+         Category = rev(c("90% - 100%", "70% - 89%", "50% - 69%", 
+                          "30% - 49%", "1% - 29%")))
+
+popPerRiskPlot <- ggplot(data=popBin, aes(Category, sumPop)) +
+  geom_bar(position = "dodge", stat="identity") +
+  labs(x= "Predicted Risk Levels",
+       y= "Number of People",
+       title = "Population per risk category",
+       caption = "Figure 2.1") +
+  plotTheme()
+
+# poverty rate correlation with predicted maltreatment count -------------
+geom_fishnet <- error_geoplot_mask %>% 
+  dplyr::select(net_id, geometry)
+
+#get population and poverty info at tract level
+tracts <- tract10 %>% 
+  dplyr::select(TotalPoverty, TotalPop, tract_id, geometry) %>% 
+  mutate(tract_acre = as.numeric(st_area(.)*2.29568e-5),
+         pov_acre_rate = TotalPoverty/tract_acre,
+         pop_acre_rate = TotalPop/tract_acre)
+
+#intersect tracts and fishnet
+tracts_intersect <- st_intersection(tracts, geom_fishnet)
+
+tracts_intersect <- tracts_intersect %>%
+  mutate(int_area_acres = as.numeric(st_area(tracts_intersect)*2.29568e-5)) %>%
+  group_by(net_id) %>%
+  mutate(cnt = n(),
+         pcnt_of_block = int_area_acres/tract_acre,
+         int_pov = TotalPoverty * pcnt_of_block,
+         int_pop = TotalPop * pcnt_of_block) %>%
+  group_by(net_id) %>%
+  summarise(net_pov = sum(int_pov),
+            net_pop = sum(int_pop)) %>% 
+  mutate(povRate = net_pov/net_pop) %>% 
+  na.omit() %>% # some cells are 0 pop/0 poverty giving NaN - removing those
+  st_sf() %>% 
+  st_transform(102685)
+
+#map it:
+povertyRateMap <- ggmap(base_map) +
+  geom_sf(data=ll(tracts_intersect), aes(fill=factor(ntile(povRate, 5))), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  scale_fill_viridis_d(labels = as.character(round(quantile(tracts_intersect$povRate,
+                                                            c(.1,.2,.4,.6,.8),na.rm=T), 4)),
+                       name="Poverty\nRate\n(Quintile\nBreaks)") +
+  labs(title = "Weighted poverty rate") +
+  mapTheme()
+
+pov_pop_fishnet_pred <- left_join(tracts_intersect %>% as.data.frame(), error_geoplot_mask %>% 
+                                    dplyr::select(net_id, pred) %>% as.data.frame(),
+                                  by = "net_id") %>% 
+  filter(pred > 0)
+
+povRatePredPlot <- ggplot(pov_pop_fishnet_pred, aes(x=povRate, y=pred)) + 
+  geom_point() +
+  labs(x = "Poverty Rate",
+       y = "Predicted Maltreatment Counts",
+       title = "Relationship between predicted maltreatment counts and poverty rate",
+       caption = "Figure 2.2") +
+  plotTheme()
+
+# risk categoeries and removals  ----------
+removalsMap <- ggmap(base_map) +
+  geom_sf(data=ll(error_geoplot_mask), aes(fill=factor(pred_bin_class)), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  geom_sf(data=ll(removals),aes(colour="Removals"),colour="red", inherit.aes = FALSE, size = 1) +
+  scale_fill_viridis_d(name = "Risk\nCategory") +
+  labs(title="Predicted risk levels and removals",
+       subtitle="2019 Removals in red") +
+  mapTheme()
+
+removalsPlot <- removals %>%
+  mutate(counter=1) %>%
+  aggregate(error_geoplot_mask,FUN=length) %>%
+  dplyr::select(counter) %>%
+  mutate(counter = ifelse(is.na(counter),0,counter)) %>%
+  bind_cols(error_geoplot_mask) %>%
+  mutate(Category = case_when(pred_bin_class == 1 ~ "1% - 29%",
+                              pred_bin_class == 2 ~ "30% - 49%%",
+                              pred_bin_class == 3 ~ "50% - 69%",
+                              pred_bin_class == 4 ~ "70% - 89%",
+                              pred_bin_class == 5 ~ "90% - 100%")) %>%
+  group_by(Category) %>%
+  dplyr::summarize(percentCount = sum(counter)/nrow(removals)) %>%
+  ggplot(aes(Category,percentCount)) +
+  geom_bar(position = "dodge", stat="identity") +
+  labs(x= "Predicted Risk Levels",
+       y="Percent of Removals",
+       title= "Percent of removals by risk category",
+       subtitle = paste0("n = ", nrow(removals)),
+       caption = "Figure 2.3") +
+  plotTheme()
+
+# protective land uses and risk categories -------------
+#add the data
+protectiveAlign_list <- list()
+for (i in seq_along(protective_list)) {
+  
+  interim <- protective_list[[i]] %>% 
+    dplyr::select(contains('address')) %>% 
+    mutate(feature_name = names(protective_list[i]))
+  
+  names(interim)[1] <- "Address"
+  protectiveAlign_list[length(protectiveAlign_list) + 1] <- list(interim)
+  
+}
+
+protectiveAlign <- do.call(rbind, protectiveAlign_list) %>% 
+  rbind(., collab_familiesFirst %>% 
+          rename(Address = address,
+                 feature_name = type) %>% 
+          dplyr::select(Address, feature_name, geometry))
+
+#map 
+protectiveUsesByType <- ggmap(base_map) +
+  geom_sf(data=ll(st_union(error_geoplot_mask)), inherit.aes = FALSE, alpha = 0.6, color = NA) +
+  geom_sf(data=ll(protectiveAlign), aes(colour = feature_name), inherit.aes = FALSE, size = 0.75) +
+  facet_wrap(~feature_name) +
+  scale_colour_viridis_d(name="Protective\nuses") +
+  labs(title="Protective land uses",
+       caption = "Figure 2.6") +
+  mapTheme() +
+  theme(
+    legend.key = element_rect(fill = "white"),
+    strip.text = element_text(face = "plain", size = 11, hjust = 0),
+    strip.background = element_rect(fill = "white"),
+    legend.position = "none"
+  )
+
+#mea predictive count by quarter
+protectiveAlign.buffers <- st_centroid(error_geoplot_mask) %>%
+  aggregate(st_buffer(protectiveAlign, 1320), FUN=mean) %>%
+  bind_cols(protectiveAlign)
+
+#map average predicted event by quarter mile buffer
+quarterMileBuffer_protective <- ggmap(base_map) +
+  geom_sf(data=ll(st_union(error_geoplot_mask)), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  geom_sf(data=ll(protectiveAlign.buffers), aes(fill=pred), color = NA, inherit.aes = FALSE, alpha = 0.8) +
+  facet_wrap(~feature_name) +
+  scale_fill_viridis(option = "D",
+                     name = "Mean\npredicted\ncount") +
+  labs(title = "Mean predicted count by quarter mile buffer",
+       subtitle = "Protective uses",
+       caption = "Figure 2.7") +
+  #guides(fill = guide_colourbar(reverse = TRUE)) +
+  mapTheme() +
+  theme(
+    legend.key = element_rect(fill = "white"),
+    strip.text = element_text(face = "plain", size = 11, hjust = 0),
+    strip.background = element_rect(fill = "white")
+  )
+
+top_protect <- protectiveAlign.buffers %>%
+  bind_cols(protectiveAlign) %>%
+  #group_by(feature_name) %>%
+  top_n(n=20,wt=pred) %>%
+  rename(Mean_Predicted_Count = pred,
+         Protective_Use = feature_name) %>% 
+  as.data.frame() %>% 
+  dplyr::select(-geometry, -geometry1) %>% 
+  rename(geometry = geometry2) %>% 
+  st_sf()
+
+# map of top 20 protective land uses by type
+top20MAP <- ggmap(base_map) +
+  geom_sf(data=ll(st_union(error_geoplot_mask)), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  geom_sf(data = ll(top_protect), aes(color = Protective_Use), inherit.aes = FALSE, alpha = 0.8, size = 0.9) +
+  scale_color_viridis_d(option = "D",
+                       name = "Type") +
+  labs(title = "Top 20 optimally located protective land uses",
+       caption = "Figure 2.8") +
+  mapTheme()
+
+#table of top protective places
+protectiveTab <- top_protect %>%
+  as.data.frame() %>% 
+  dplyr::select(Protective_Use, Address, Mean_Predicted_Count) %>%
+  arrange(-Mean_Predicted_Count) %>%
+  kable() %>% 
+  kable_styling(bootstrap_options = "condensed")
+
+collab_families_buffer_MAP <- ggmap(base_map) +
+  geom_sf(data=ll(st_union(error_geoplot_mask)), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  geom_sf(data=ll(protectiveAlign.buffers %>% filter(feature_name %in% c("Collaborative", "Families First DC"))), 
+          aes(fill=pred), color = NA, inherit.aes = FALSE, alpha= 0.8) +
+  facet_wrap(~feature_name) +
+  scale_fill_viridis(option = "D",
+                     name = "Mean\npredicted\ncount") +
+  labs(title = "Mean predicted count by quarter mile buffer",
+       caption = "Figure 2.9") +
+  mapTheme() +
+  theme(
+    legend.key = element_rect(fill = "white"),
+    strip.text = element_text(face = "plain", size = 11, hjust = 0),
+    strip.background = element_rect(fill = "white")
+  )
+
+collab_families_TAB <- protectiveAlign.buffers %>% 
+  bind_cols(protectiveAlign) %>%
+  filter(feature_name %in% c("Collaborative", "Families First DC")) %>%
+  #group_by(feature_name) %>%
+  as.data.frame() %>% 
+  rename(Mean_Predicted_Count = pred,
+         Protective_Use = feature_name) %>% 
+  dplyr::select(Protective_Use, Address, Mean_Predicted_Count) %>%
+  arrange(-Mean_Predicted_Count) %>%
+  kable() %>% 
+  kable_styling(bootstrap_options = "condensed")
+
+# cpted ------------
+# get risk infrastructure
+riskAlign_list <- list()
+for (i in c("Laundromats", "Convenience Stores", "Hair/Nail Salons", "Check_Cashing", "NonDepository Banks",
+            "Public Housing")) {
+  
+  interim <- risk_list[[i]] %>% 
+    dplyr::select(contains('address'), geometry) %>% 
+    mutate(feature_name = i) %>% 
+    as.data.frame()
+  
+  names(interim)[1] <- "Address"
+  
+  riskAlign_list[length(riskAlign_list) + 1] <- list(interim)
+  
+}
+
+busSTOP_align <- var_list[["BusStops"]] %>% 
+  rename(Address = BSTP_MSG_TEXT) %>% 
+  mutate(feature_name = "Bus Stop") %>% 
+  dplyr::select(Address, geometry, feature_name)
+
+liquor_align <- var_list[["Liquor_Licenses"]] %>% 
+  rename(Address = ADDRESS) %>% 
+  mutate(feature_name = case_when(TYPE %in% c("Bar", "Restaurant") ~ "Restaurants w/ Licenses (Bars)",
+                                  TYPE == "Retailer" ~ "Liquor Retailer")) %>% 
+  dplyr::select(Address, geometry, feature_name)
+
+riskAlign_list[[8]] <- as.data.frame(busSTOP_align)
+riskAlign_list[[9]] <- as.data.frame(liquor_align)
+
+riskAlign <- do.call(rbind, riskAlign_list) %>% 
+  st_sf()
+
+# find risk infrastructure in the 5th risk category
+risk_in5th <- st_intersection(riskAlign, error_geoplot_mask %>% filter(pred_bin_class == 5)) %>% 
+  mutate(Predicted_Count = round(pred),
+         test = duplicated(Address)) %>% 
+  filter(test != "TRUE") %>% 
+  dplyr::select(-test)
+# make a table of these locations
+risk_in5th_table <- risk_in5th %>% 
+  as.data.frame() %>% 
+  rename(Risk_Location = feature_name) %>% 
+  dplyr::select(Risk_Location, Address, Predicted_Count) %>% 
+  arrange(-Predicted_Count) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "condensed")
+
+# get the violations we are interested in (based on closeness tests)
+violations <- rbind(
+  var_list[["VIO.1718_Abandoned Vehicle - On Public Property"]] %>% 
+    dplyr::select(SERVICECODEDESCRIPTION, geometry),
+  var_list[["VIO.1718_Abandoned Vehicle - On Private Property"]] %>% 
+    dplyr::select(SERVICECODEDESCRIPTION, geometry),
+  var_list[["VIO.1718_Illegal Dumping"]]  %>% 
+    dplyr::select(SERVICECODEDESCRIPTION, geometry)
+) %>% 
+  mutate(counter = 1)
+
+# find top 20 risky infrastructure locations
+risk_top20 <- risk_in5th %>% 
+  top_n(n=20,wt=pred)
+
+# make quarter mile buffer around these top 20 locations
+# count how many violations
+riskAlign.buffers <- violations %>%
+  dplyr::select(-SERVICECODEDESCRIPTION) %>% 
+  aggregate(st_buffer(risk_top20, 1320), FUN=sum) %>%
+  bind_cols(risk_top20 %>% dplyr::select(Address, feature_name))
+
+# map quarter mile buffers by count of violations
+#map average predicted event by quarter mile buffer
+quarterMileBuffer_risk <- ggmap(base_map) +
+  geom_sf(data=ll(st_union(error_geoplot_mask)), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  geom_sf(data=ll(riskAlign.buffers), aes(fill=counter), color = NA, inherit.aes = FALSE, alpha = 0.8) +
+  facet_wrap(~feature_name) +
+  scale_fill_viridis(option = "D",
+                     name = "Mean\npredicted\ncount") +
+  labs(title = "Total 311 calls within a quarter mile of top 20 risk infrastructure locations",
+       subtitle = "Abandoned vehicles and illegal dumping 311 calls",
+       caption = "Figure 2.13") +
+  #guides(fill = guide_colourbar(reverse = TRUE)) +
+  mapTheme() +
+  theme(
+    legend.key = element_rect(fill = "white"),
+    strip.text = element_text(face = "plain", size = 11, hjust = 0),
+    strip.background = element_rect(fill = "white")
+  )
+
+riskAlign.buffers_TABLE <- riskAlign.buffers %>% 
+  as.data.frame() %>% 
+  rename(Risk_Location = feature_name,
+         Sum_311_incidents = counter) %>% 
+  dplyr::select(Risk_Location, Address, Sum_311_incidents) %>% 
+  arrange(-Sum_311_incidents) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "condensed")
+
+# risk by elementary school catchment areas ---------------
+
+catch_pred <- st_centroid(error_geoplot_mask) %>%
+  aggregate(schools_join, FUN=mean) %>% 
+    mutate(class = case_when(pred <= 0.1 ~ "< 0.1", 
+                             pred > 0.1 & pred < 0.5 ~ "0.1 to 0.49",
+                             pred >= 0.5 & pred < 1 ~ "0.5 to 0.99",
+                             pred >= 1 & pred < 3 ~ "1 to 2.99",
+                             pred >= 3 ~ "3+")) %>% 
+  bind_cols(schools_join)
+
+frameworkStar_Map <- ggmap(base_map) +
+  geom_sf(data=ll(schools_join), aes(fill = Framework.STAR.Rating), inherit.aes = FALSE, alpha = 0.8) +
+  scale_fill_manual(values = c("#440154FF", "#404788FF", "#238A8DFF", "#55C667FF", "#FDE725FF", "black"),
+                    name = "Framework.Star\nRating") +
+  labs(title = "Framework Star Rating",
+       subtitle = "Elementary schools") +
+  mapTheme()
+
+avgPredCatch_Map <- ggmap(base_map) +
+  geom_sf(data = ll(catch_pred), aes(fill = class), colour = "black", inherit.aes = FALSE, alpha = 0.8) +
+  scale_fill_viridis_d(option = "D",
+                       direction = 1,
+                       name = "Mean\nPredicted\nCount") +
+  labs(title = "Average maltreatment risk by\nelementary attendance zones",
+       caption = "Figure 2.11") +
+  theme(axis.title = element_text(colour = "white"),
+        axis.text = element_text(colour = "white"),
+        axis.ticks = element_blank(),
+        plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+        plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+        plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+        legend.title = element_text(size = 10, family = "sans"),
+        legend.text = element_text(size = 9, family = "sans")
+    )
+
+catch_pred_forCor <- catch_pred %>% filter(!is.na(Framework.STAR.Score))
+cor_coeff <- cor(catch_pred_forCor$Framework.STAR.Score, catch_pred_forCor$pred)
+
+risk_rating_scatter <- ggplot(catch_pred) +
+  geom_point(aes(y = pred, x = Framework.STAR.Score), size = 1) +
+  scale_x_continuous(limits = c(0,100)) +
+  labs(x = "STAR Framework Scores",
+       y = "Average Predicted Maltreatment Count",
+       title = "Relationship between predicted maltreatment counts and school quality",
+       caption = "Figure 2.12") +
+  plotTheme()
+ 
+# foster cares and risk categories ------------
+fosterCares_map <- ggmap(base_map) +
+  geom_sf(data=ll(error_geoplot_mask), aes(fill=factor(pred_bin_class)), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  geom_sf(data=st_jitter(ll(st_difference(fosterCares) %>% 
+                                .[bind_cols(error_geoplot,
+                                            aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                    filter(counter != 1),]), 0.0025), inherit.aes = FALSE, colour="red") +
+  scale_fill_viridis_d(name = "Risk\nCategory") +
+  labs(title="Predicted risk levels and foster care locations",
+       subtitle="Foster cares active in 2019 in red",
+       caption = "Figure 2.5\nPrivacy Controls: Maltreatment events in grid cells\nwith 1 point are masked; Remaining event\nlocations are offset at random") +
+  mapTheme()
+
+fosterCares_plot <- fosterCares %>%
+  mutate(counter=1) %>%
+  aggregate(error_geoplot_mask,FUN=length) %>%
+  dplyr::select(counter) %>%
+  mutate(counter = ifelse(is.na(counter),0,counter)) %>%
+  bind_cols(error_geoplot_mask) %>%
+  mutate(Category = case_when(pred_bin_class == 1 ~ "1% - 29%",
+                              pred_bin_class == 2 ~ "30% - 49%%",
+                              pred_bin_class == 3 ~ "50% - 69%",
+                              pred_bin_class == 4 ~ "70% - 89%",
+                              pred_bin_class == 5 ~ "90% - 100%")) %>%
+  group_by(Category) %>%
+  dplyr::summarize(percentCount = sum(counter)/nrow(fosterCares)) %>%
+  ggplot(aes(Category,percentCount)) +
+  geom_bar(position = "dodge", stat="identity") +
+  labs(x= "Predicted Risk Levels",
+       y="Percent of foster cares",
+       title= "Percent of foster cares by risk category") +
+  plotTheme()
+
+# alternative response -------------
+altRespPlot <- altResp %>%
+  mutate(counter=1) %>%
+  aggregate(error_geoplot_mask,FUN=length) %>%
+  dplyr::select(counter) %>%
+  mutate(counter = ifelse(is.na(counter),0,counter)) %>%
+  bind_cols(error_geoplot_mask) %>%
+  mutate(Category = case_when(pred_bin_class == 1 ~ "1% - 29%",
+                              pred_bin_class == 2 ~ "30% - 49%%",
+                              pred_bin_class == 3 ~ "50% - 69%",
+                              pred_bin_class == 4 ~ "70% - 89%",
+                              pred_bin_class == 5 ~ "90% - 100%")) %>%
+  group_by(Category) %>%
+  dplyr::summarize(percentCount = sum(counter)/nrow(altResp)) %>%
+  ggplot(aes(Category,percentCount)) +
+  geom_bar(position = "dodge", stat="identity") +
+  labs(x= "Predicted Risk Levels",
+       y="Percent of Alternative Response Cases",
+       title= "Percent of alternative response cases by risk category",
+       caption = "Figure 2.4") +
+  plotTheme()
+
+# average risk by ward ---------------
+ward_pred <- st_centroid(error_geoplot_mask) %>%
+  aggregate(wards, FUN=mean)
+
+avgPredWard_Map <- ggmap(base_map) +
+  geom_sf(data = ll(ward_pred), aes(fill = pred), inherit.aes = FALSE, alpha = 0.8) +
+  scale_fill_viridis(option = "D",
+                     direction = 1,
+                     name = "Mean\nPredicted\nCount") +
+  labs(title = "Average maltreatment risk by ward",
+       caption = "Figure 2.10") +
+  theme(axis.title = element_text(colour = "white"),
+        axis.text = element_text(colour = "white"),
+        axis.ticks = element_blank(),
+        plot.title = element_text(size = 14, family = "sans", face = "plain", hjust = 0),
+        plot.subtitle=element_text(size = 11, family = "sans", hjust = 0),
+        plot.caption=element_text(size = 10, family = "sans", face = "italic", hjust = 0),
+        legend.title = element_text(size = 10, family = "sans"),
+        legend.text = element_text(size = 9, family = "sans")
+    )
+
+# gap analysis --------------
+#get neighborhoods
+nbr2 <- nbr %>%
+  #calculate area
+  mutate(area.sq_miles = as.numeric(st_area(.) * 3.58701e-8))
+
+#create a dummy variable field for where risk category == 5
+error_geoplot_mask$is5th <- ifelse(error_geoplot_mask$pred_bin_class == 5,1,0)
+#count 5th risk quintile per neighborhood
+nbr.demand <- st_centroid(error_geoplot_mask) %>%
+  dplyr::select(is5th,geometry) %>%
+  aggregate(nbr2,FUN=sum) %>%
+  bind_cols(
+    st_centroid(error_geoplot_mask) %>%
+    mutate(counter=1) %>%
+    dplyr::select(counter,geometry) %>%  
+    aggregate(nbr2,FUN=sum)) %>% 
+  mutate(relativeRisk = ntile((is5th / counter), 100)) %>% 
+  replace(is.na(.), 0)
+
+#calculate number of protective centers within 
+nbr.supply <- protectiveAlign %>%
+  mutate(counter= 1) %>%
+  dplyr::select(counter,geometry) %>%
+  aggregate(nbr2,FUN=sum) %>%
+  bind_cols(nbr2) %>%
+  dplyr::select(counter,geometry,area.sq_miles) %>%
+  mutate(relativeProtective = ntile((counter/area.sq_miles),100))  %>% 
+  replace(is.na(.), 0)
+  
+#put demand and supply together and look at difference
+nbr.gap <- bind_cols(nbr.demand, nbr.supply) %>%
+  mutate(gap = relativeProtective - relativeRisk)
+
+#map average predicted event by neighborhoods
+bl <- colorRampPalette(c("green2","green3","green4"))(200)                      
+re <- colorRampPalette(c("darkred", "red3","red1"))(200)
+
+gapMap <- ggmap(base_map) +
+  geom_sf(data=ll(nbr.gap), aes(fill=gap), inherit.aes = FALSE,alpha = 0.9) +
+  scale_fill_gradientn(colours=c(re,"green2", bl),
+                       limits = c(-100,100),
+                       breaks = c(-100,100),
+                       labels = c("More risk\nthan protection","More protection\nthan risk")) +
+  labs(title = "Gap analysis",
+       subtitle = "Comparing relative risk to protective resources",
+       caption = "Figure 2.14") +
+  mapTheme() +
+  theme(legend.position = 'bottom',
+        legend.title=element_blank(),
+        legend.text=element_text(size=10, face = "bold"),
+        legend.justification = "center") +
+  guides(fill= guide_colorbar(barwidth=15,barheight=2))
+```
+
+```{r fishnetPLOT}
+fullNET_Mask <- net_DC %>% 
+  left_join(., net_mask %>% mutate(mask = 1) %>% as.data.frame(), by = "net_id") %>% 
+  replace(is.na(.), 0) 
+
+fullNET_Mask_PLOT <- ggmap(base_map) + 
+  geom_sf(data = ll(fullNET_Mask), aes(fill = as.factor(mask)), inherit.aes = FALSE, alpha = 0.8) + 
+  scale_fill_manual(name = " ",
+                    labels = c("masked", "not masked"),
+                    values = c("#440154FF", NA)) +
+  labs(title = "Study area fishnet",
+       caption = "Figure 1.5") +
+  mapTheme()
+```
+
+```{r descriptives}
+mal_3yr <- var_list[["ScreenedIn_Cases"]] %>%
+  filter(REPORTING_PERIOD %in% c("FY 2017", "FY 2018", "FY 2019"))
+values <- unique(mal_3yr[[variable]])
+dat_breakdown <- list()
+for(i in seq_along(values)){
+  #print(values[i])
+  
+  dat <- filter(mal_3yr, !!as.name(variable) == values[i]) %>% 
+    mutate(value = 1) %>% 
+    dplyr::select(value) %>% 
+    aggregate(., net, sum) %>%
+    mutate(value = ifelse(is.na(value),0,value)) %>% 
+    .[unique(unlist(st_intersects(nbr, .))),]
+  
+  dat_breakdown[[i]] <- dat
+  
+}
+
+sum_stats_table <- data.frame(
+  year = c("2017", "2018", "2019"),
+  total_count = c(sum(dat_breakdown[[1]]$value), sum(dat_breakdown[[2]]$value), sum(dat_breakdown[[3]]$value)),
+  max_count_byGridCell = c(max(dat_breakdown[[1]]$value), max(dat_breakdown[[2]]$value), max(dat_breakdown[[3]]$value)),
+  min_count_byGridCell = c(min(dat_breakdown[[1]]$value), min(dat_breakdown[[2]]$value), min(dat_breakdown[[3]]$value)),
+  avg_count_byGridCell = c(round(mean(dat_breakdown[[1]]$value),2), 
+                           round(mean(dat_breakdown[[2]]$value), 2), 
+                           round(mean(dat_breakdown[[1]]$value), 2))
+) %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "condensed")
+```
+
+
+Note: This report presents results for the Urban Spatial/Predict Align Prevent analysis predicting geospatial child maltreatment risk in the District of Columbia. The work presented here is based on the PAP research protocol. Some additions will be made over the next week, which will be shared before the final presentation the week of March 9th.
+
+This document is designed to be read alongside the [Urban Spatial/PAP Technical Appendix](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/). Links are provided throughout the document to the corresponding sections in the Technical Appendix to provide an in-depth explanation of the methods used in the workflow. 
+
+For readers interested in the policy implications of this study, an Executive Summary is provided in Section 1 and the strategic planning tools are demonstrated in Section 2. Sections 3 and 4 present more details on the workflow and predictive model. Section 5 concludes.
+
+
+## 1. Executive Summary
+
+```{r studyareaMAP, include = TRUE, fig.height = 5}
+ggmap(base_map) +
+  geom_sf(data=ll(nbr), inherit.aes = FALSE, alpha = 0.8, color = NA) +
+  labs(title = "Study area boundaries",
+       subtitle = "Washington, D.C.",
+       caption = "Figure 1.1") +
+  mapTheme()
+```
+
+Washington D.C., our nation's capital, has a population of 672,000 spread out across ~68 square miles. D.C. has experienced 677, 722, 892, 923, 948 substantiated reports of child maltreatment in 2015, 2016, 2017, 2018, and 2019 respectively. As Figure 1.2 below suggests, maltreatment is on the rise.
+
+```{r malOverTimePLOT, include = TRUE, fig.width = 8.5}
+initial_malOT_PLOT + labs(y = "Count of Events", x = "Reporting Period")
+```
+
+While the number of maltreatment events may be increasing, the spatial distribution has remained consistent over time. Figure 1.3 visualizes maltreatment events as hotspot or kernel density maps and is clearly clustered in a handful of communities, most notably, the Anacostia neighborhood in the southeast.
+
+```{r malOverSpacePLOT, include = TRUE, fig.width = 8.5}
+initial_malOS_PLOT
+```
+
+This spatial pattern is most pronounced when maltreatment events for 2017, 2018, and 2019 are summed by neighborhood and ward, as in Figure 1.4.
+
+```{r malCOUNT_by_nbr_ward_PLOT, include = TRUE, fig.width = 8.5, fig.height = 4}
+mal_by_nbr_PLOT <- ggmap(base_map) +
+  geom_sf(data = ll(mal_by_nbr), aes(fill = cut_val), 
+          color = NA, alpha = 0.8, inherit.aes = FALSE) +
+  scale_fill_viridis_d(direction = 1,
+                       name="Count") +
+  labs(title = "Number of maltreatment events",
+       subtitle = "By neighborhood",
+       caption = "Figure 1.4") +
+  mapTheme()
+
+mal_by_ward_PLOT <- ggmap(base_map) +
+  geom_sf(data = ll(mal_by_ward), aes(fill = cut_val), 
+          color = NA, alpha = 0.8, inherit.aes = FALSE) +
+  scale_fill_viridis_d(direction = 1,
+                       name="Count") +
+  labs(subtitle = "By ward") +
+  mapTheme()
+
+cowplot::plot_grid(mal_by_nbr_PLOT, mal_by_ward_PLOT, ncol = 2, align = "hv", axis = "lrbt")
+```
+
+Child maltreatment is relatively rare, and by nature, likely under-reported. There is likely more maltreatment activity than what is reported by community stakeholders or substantiated by the City. Thus, the observed count of substantiated maltreatment likely discounts the actual _risk_ of maltreatment.
+
+We characterize this phenomena as _latent risk_ and present a set of analytics below that predict latent maltreatment risk throughout D.C. to help stakeholders better 'align' limited child welfare resources with demand for those services. Washington D.C. deploys at least two different community-level interventions to mitigate maltreatment risk. Our goal is to provide a robust tool that allows them to better target these limited resources in the communities that need them most.
+A geospatial risk predictive model is estimated to predict maltreatment risk for every location in Washington D.C. The intuition is to borrow the observed maltreatment 'experience' in D.C. and test whether those experiences generalize to places where maltreatment may be occurring but is not directly observed. If this experience is generalizable, one can confidently forecast maltreatment risk across space.
+
+The basic hypothesis of the approach is that maltreatment risk is a function of _exposure_ to a series of geospatial risk and protective factors. Examples of the former might be blight, while examples of the latter may include community centers, libraries, and churches.
+Exposure between maltreatment and risk/protective factors is measured by relating one to the other across a lattice grid of polygons, the 'fishnet', that comprise the entire city (Figure 1.5). The size of each grid cell is 1000 by 1000 ft<sup>2</sup> - a size comparable to roughly five city blocks. Empirically, this scale helps satisfy both the assumptions of the statistical model used to predict and the need to target community interventions at a scale smaller than the neighborhood but larger than a single city block.
+
+```{r emptyFishnet, include = TRUE, fig.height=5}
+fullNET_Mask_PLOT
+```
+
+Figure 1.5 visualizes the study area of this analysis. Approximately 20 square miles (30% of the city's total area) of national park land and hydrology is masked from the analysis. Maltreatment events for 2017, 2018, and 2019 are summed for each grid cell, and in Figure 1.6 below, the maltreatment rate per 100 people is visualized. A clearer picture of the maltreatment hotspots in Washington D.C. now emerge.
+
+```{r malCount_per100People, include = TRUE}
+net_mal_rate <- left_join(fishnet_pop %>% as.data.frame(), net_DC %>% as.data.frame(), by = "net_id") %>% 
+  dplyr::select(-geometry.x) %>% 
+  rename(geometry = geometry.y) %>% 
+  mutate(value = replace_na(value, 0),
+         rate = value/(net_pop/100)) %>% 
+  make_cuts(., "rate", cuts = "breaks", n_breaks = 10) %>% 
+  st_sf() %>% 
+  st_transform(102685)
+
+ggmap(base_map) +
+  geom_sf(data = ll(net_mal_rate), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  labs(title = "Matlreatment event rate per 100 people",
+       caption = "Figure 1.6") +
+  scale_fill_viridis_d(na.value = NA, 
+                       option = "D", 
+                       direction = 1, 
+                       name = "Rate\nper 100") +
+  mapTheme()
+```
+
+Additional hypothesis testing reveals hotspots exhibit greater local clustering than we might otherwise expect due to random chance alone. Figure 1.7 visualizes both maltreatment counts for each fishnet grid cell and those local maltreatment clusters significant at the p = 0.05 level. These significant clusters appear in Anacostia, Columbia Heights, and near Benning. 
+
+```{r execSum_MoransI, include = TRUE, fig.width = 8.5, fig.height=4}
+cowplot::plot_grid(ggmap(base_map) +
+                     geom_sf(data = ll(fishnet_pop_cps_morans_cut), aes(fill = cut_val),
+                             color = NA, inherit.aes = FALSE, alpha = 0.9) +
+                     scale_fill_viridis_d(na.value=NA, name = "Maltreatment\nEvents", option = "D" ) +
+                     labs(title = "Maltreatment count by fishnet\nFY 2017 - FY 2019",
+                          caption = "Figure 1.7") +
+                     mapTheme(),
+                   ggmap(base_map) +
+                     geom_sf(data = ll(p_cut), aes(fill = pval_cut),
+                             color = NA, inherit.aes = FALSE, alpha = 0.9) +
+                     scale_fill_viridis_d(na.value=NA, name = "p-value", option = "D") +
+                     labs(title = "Statistically significant\nmaltreatment clusters") +
+                     mapTheme(),
+                   align = "hv", axis = "lrbt", ncol = 2)
+```
+
+Once maltreatment is associated with each fishnet grid cell. Several 'feature engineering' strategies, explained in Section 3 below, are developed measuring exposure from each grid cell to nearby risk and protective factors. Figure 1.8 visualizes the three such feature engineering strategies. Figure 1.8a visualizes the locations of homeless shelters. Figure 1.8b, 1.8c, and 1.8d measure exposure by: counting the number of shelters for each grid cell; measuring the euclidean or straight-line distance from each cell to its nearest shelter; and measuring the _average_ distance from each grid cell to its _n_ nearest shelters.
+
+```{r execSum_featEng, include = TRUE, fig.width = 8.5, fig.height = 6}
+cowplot::plot_grid(shelters_map, shelters_agg_map,
+                   shelters_ed_map + labs(caption = "Figure 1.8"), shelters_NN_map, 
+                   align="hv", axis = "rlbt", ncol=2)
+```
+
+Exploratory Data Analysis (Section 3) estimates correlations for each of the three feature engineering strategies across the 29 risk and protective factors gathered for this analysis. A set of final features are selected for inclusion in the predictive modeling phase. These features are then used to predict maltreatment count across D.C., and do so with an error rate of less than half of one maltreatment event on average. Far more methodological context for the predictive model is provided in Section 4 below as well as [Section 6](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#6_model_fitting_and_stacking) and [Section 7](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#7_model_validation) in the Technical Appendix.
+
+Figure 1.9 visualizes the predicted count of maltreatment throughout the city as well as prediction errors. These predictions are a measure of maltreatment risk and not surprisingly, cluster in the aforementioned neighborhoods. Section 4 provides a host of analytics that test predictive accuracy and generalizability across different D.C. communities.
+
+```{r execSum_metaModelJawn, include = TRUE, fig.width = 8.5, fig.height = 4}
+cowplot::plot_grid(ens_pred_geoplot_mask[[2]] +
+                     labs(title = "Meta-Model",
+                          subtitle = "Predicted Maltreatment Count",
+                          caption = "Figure 1.9"),
+                   ens_pred_geoplot_mask[[1]] +
+                     labs(subtitle = "MAE"), align = "h")
+```
+
+Finally, Figure 1.10 provides a measure of how well the predictive model helps to target limited child welfare resources relative to the most common method of hotspot analysis - kernel density. Figure 1.10a shows the kernel density calculated on maltreatment from 2017 and 2018. The overlaid points are maltreatment events from 2019 (offset slightly in space to protect individual privacy). Figure 1.10b visualizes the maltreatment risk predictions, trained from 2017 and 2018 maltreatment events with 2019 events overlaid.
+
+Validating predictions generated from 2017-2018 on 2019 maltreatment events provides a critical test for the model's ability to predict into the near future. Visually, the risk predictions provide a better tool for targeting community interventions. There are also a host of locations where few 2019 events actually occurred, highlighting places with latent risk for maltreatment. Section 4 provides an additional test of the potential for the predictive model to target community interventions.  
+
+```{r execSum_modelKDEMaps, include = TRUE, width = 8.5, fig.height = 4}
+cowplot::plot_grid(ggmap(base_map) +
+                     geom_sf(data = ll(kde.summ), aes(fill = factor(sens_group)),
+                             color = NA, alpha = 0.85, inherit.aes = FALSE) +
+                     geom_sf(data = st_jitter(ll(st_difference(points.2019) %>%
+                                                   .[bind_cols(error_geoplot,
+                                                               aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                                       filter(counter != 1),]), 0.0025),
+                             inherit.aes = FALSE, size = 0.75)  +
+                     scale_fill_viridis_d(na.value = NA, option = "D", direction = 1,
+                                          name = "Risk\nCategory") +
+                     labs(title = "KDE risk categories\noverlaid with 2019 screened-in cases",
+                          caption = "Figure 1.10\nPrivacy Controls: Maltreatment events in grid cells\nwith 1 point are masked; Remaining event\nlocations are offset at random") +
+                     mapTheme(),
+                   ggmap(base_map) +
+                     geom_sf(data = ll(p.summ), aes(fill = factor(sens_group)),
+                             color = NA, alpha = 0.85, inherit.aes = FALSE) +
+                     geom_sf(data = st_jitter(ll(st_difference(points.2019) %>%
+                                                   .[bind_cols(error_geoplot,
+                                                               aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                                       filter(counter != 1),]), 0.0025),
+                             inherit.aes = FALSE, size = 0.75) +
+                     scale_fill_viridis_d(na.value = NA, option = "D", direction = 1,
+                                          name = "Risk\nCategory") +
+                     labs(title = "Meta-model risk categories\noverlaid with 2019 screened-in cases") +
+                     mapTheme(),
+                   ncol = 2, align = "hv", axis = "lrbt")     
+```
+
+The geospatial risk prediction model created for this project provides an objective tool child welfare practitioners in Washington D.C. can use to allocate limited resources in the communities most at need.
+
+The next section describes how these risk predictions can be adopted into a strategic planning process to 'align' the supply of child welfare resources with the demand for those services in space. Section 3 discusses the Exploratory Data Analysis; Section 4 presents the predictive model; and Section 5 concludes. 
+
+
+## 2. Align
+
+The risk prediction methodology is most useful when deployed in a strategic planning framework. Such a framework is introduced here. The section begins by relating maltreatment risk to a host of other social phenomena. Predicted risk is then associated with protective factors throughout D.C. - places where stakeholders may wish to deploy community interventions. Finally, a simple gap analysis is performed to show neighborhoods where there are more protective factors than maltreatment and conversely, areas where there is more risk than protection.
+
+### 2.1 How many Washingtonians live in high risk areas?
+
+How many people live in areas with high predicted maltreatment risk? Figure 2.1 shows that approximately 105,000 people live in the highest risk category, an area that comprises only about 10% of the District. Another 160,000 people are located in the second highest risk category, indicating nearly half of Washington, D.C. residents live in areas of high demand for child welfare resources.[^1] 
+
+```{r popRiskPlot, include = TRUE, fig.width = 8.5}
+popPerRiskPlot
+
+```
+
+### 2.2 What is the relationship between poverty and maltreatment risk?
+
+Figure 2.2 maps the area weighted poverty rate by grid cell for Washington, D.C. To what extent is poverty and maltreatment risk associated? Figure 2.2 also plots predicted maltreatment risk as a function of weighted poverty rate. The scatter plot shows the correlation between poverty and predicted risk is moderate and is confirmed by a correlation coefficient of 0.46. For more information on how the weighted poverty rate is calculated, please refer to [Section 8.2](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#82_exploring_the_relationship_between_poverty_rate_and_predicted_maltreatment_risk) in the Technical Appendix.
+
+```{r povPredPlot, include = TRUE, fig.width = 8.5, fig.height = 6}
+cowplot::ggdraw() +
+  cowplot::draw_plot(povRatePredPlot + labs(caption = "Figure 2.2")) +
+  cowplot::draw_plot(povertyRateMap + 
+                       theme(legend.title = element_text(size = 5),
+                             legend.text = element_text(size = 5),
+                             plot.title = element_text(size = 7),
+                             legend.key.width=unit(.2, "cm"),
+                             legend.key.height=unit(.1, "cm"),
+                             legend.position = c(1.15, 0.5)), 
+                     x = .07, y = .515, width = .22, height = .42)
+```
+
+### 2.3 Maltreatment risk and removals of a child from the household
+
+How does maltreatment risk relate to child removals? In 2019, there were 309 cases where a child was removed from the home. Half of these removal cases occurred in the highest risk category, with another 33% of removals taking place in the second highest risk category (Figure 2.3). 
+
+```{r removalsRiskPlot, include = TRUE, fig.width = 8.5}
+removalsPlot
+```
+
+### 2.4 Do alternative response cases occur in high risk places?
+
+There is a growing recognition that not all child protective services cases require a traditional investigation. In these instances, alternative response provides an assessment of family needs that helps community agencies and other organizations support lower risk households. Alternative response frees up limited resources that child welfare agencies can then focus on higher risk cases in which maltreatment has been confirmed. Figure 2.4 shows that in Washington, D.C. the majority of alternative response cases are located in the highest and second highest risk categories. This outcome suggests that alternative response resources are currently well aligned with maltreatment risk. 
+
+```{r altRespRiskPlot, include = TRUE, fig.width = 8.5}
+altRespPlot
+```
+
+### 2.5 Maltreatment risk and foster homes
+
+Are foster homes located in high-risk areas? There is limited research on the question of whether foster home prevalence reduces environmental maltreatment risk. Nevertheless, if foster homes are a protective factor, it is reasonable to analyze their distribution relative to risk.
+
+Figure 2.5a maps foster homes in D.C. For privacy reasons, foster homes in grid cells with one point are masked and all other locations are offset slightly at random. Figure 2.5b shows that the largest number of foster homes (approximately 38%) are located in the second highest risk category. About 30% are in the highest risk category.
+
+```{r fosterRiskPlot, include = TRUE, fig.width = 9.5}
+cowplot::plot_grid(ncol = 2, align = "hv", axis = "lrbt", fosterCares_map, fosterCares_plot)
+```
+
+### 2.6 Assigning risk scores to protective land uses
+
+Protective locations are those where child welfare stakeholders may wish to deploy education, outreach, and prevention resources in the community. An ideal location is one in a high risk area. Figure 2.6 maps protective locations. Figure 2.7 extends a quarter mile radius or 'buffer' around each protective location and calculates the average risk in the local area.
+
+```{r protectiveLandUses, include = TRUE, fig.width = 11.5, fig.height=10.5}
+protectiveUsesByType
+
+```
+
+```{r qaurtermilebuffer,  include = TRUE, fig.width = 11.5, fig.height=10.5}
+quarterMileBuffer_protective
+```
+
+To communicate which specific resources are optimally located relative to maltreatment risk, Table 2.1 lists the top 20 locations citywide. These 20 locations are visualized in Figure 2.8 below. Child welfare stakeholders can use this table to more effectively target community resources.
+
+```{r protectiveTable, include = TRUE, fig.height=4}
+protectiveTab %>% 
+  scroll_box(width = "100%", height = "320px") %>% 
+  footnote(general = "Table 2.1", general_title = "")
+```
+
+<br>
+
+```{r top20Map, include = TRUE, fig.height = 5}
+top20MAP
+
+```
+
+The Child and Family Services Agency in Washington, D.C. currently manages two community intervention programs - Collaboratives and Families First D.C. centers.[^2] Collaboratives have been a community resource for years, however, Families First D.C. centers are new interventions and what services will be offered at each location are currently being discussed internally. Are these community programs located in the optimal locations? Figure 2.9 highlights the measure of risk exposure for these resources. Table 2.2 sorts these interventions by average predicted count.
+
+```{r quartermilebuffer_collabsFamilies, include = TRUE, fig.height = 5, fig.width = 8.5}
+collab_families_buffer_MAP
+
+```
+
+```{r collabsFamilies_table, include = TRUE}
+collab_families_TAB %>% 
+  footnote(general = "Table 2.2", general_title = "")
+
+```
+
+### 2.7 Average risk by ward
+
+To analyze average maltreatment risk by ward, Figure 2.10 maps the average predicted count of maltreatment events, illustrating greatest risk in Ward 7, Ward 8, and Ward 1.
+
+```{r riskbyward, include = TRUE, fig.height = 5}
+ggmap(base_map) +
+  geom_sf(data = ll(ward_pred), aes(fill = pred), inherit.aes = FALSE, alpha = 0.8) +
+  scale_fill_viridis(option = "D",
+                     direction = 1,
+                     name = "Mean\nPredicted\nCount") +
+  labs(title = "Average maltreatment risk by ward",
+       caption = "Figure 2.10") +
+  mapTheme()
+```
+
+### 2.8 Does risk correlate with school quality?
+
+Figure 2.11 visualizes the average maltreatment risk and the STAR Framework Rating for Elementary school attendance boundaries. The STAR Framework Rating is a categorical value ranging from 1 to 5, where 5 is the best rating. The figure shows that schools located in Southeast DC have a greater number of students that could be at risk of child maltreatment. These schools also have lower STAR Framework Ratings as well. 
+
+```{r catchRisk, include = TRUE, fig.width = 8.5, fig.height = 4}
+cowplot::plot_grid(ggmap(base_map) +
+                     geom_sf(data = ll(catch_pred), aes(fill = class), colour = "black", inherit.aes = FALSE, alpha = 0.8) +
+                     scale_fill_viridis_d(option = "D",
+                                          direction = 1,
+                                          name = "Mean\nPredicted\nCount") +
+                     labs(title = "Average maltreatment risk by\nElementary attendance zones",
+                          caption = "Figure 2.11") +
+                     mapTheme(),
+                   ggmap(base_map) +
+                    geom_sf(data=ll(schools_join), aes(fill = Framework.STAR.Rating), inherit.aes = FALSE, alpha = 0.8) +
+                    scale_fill_manual(values = c("#440154FF", "#404788FF", "#238A8DFF", "#55C667FF", "#FDE725FF", "black"),
+                                      name = "STAR Framework\nRating") +
+                    labs(title = "STAR Framework rating for\nElementary attendance zones") +
+                    mapTheme(),
+                   ncol = 2, align = "hv")
+```
+
+Figure 2.12 further explores the relationship between maltreatment risk and school quality, plotting average risk by attendance boundary as a function of STAR Framework Scores. Unlike the STAR Framework Rating, the STAR Framework Scores are raw scores ranging from 0 to 100, where 100 is highest quality. This plot suggests that as school quality increases, the average predicted maltreatment count decreases. This relationship is confirmed with a correlation coefficient of `r round(cor_coeff, 2)`.
+
+```{r risk_quality_plot, include = TRUE, fig.width = 8.5}
+risk_rating_scatter
+```
+
+
+### 2.9 Where should CPTED interventions locate?
+
+Crime Prevention Through Environmental Design (CPTED) is the concept that appropriate environmental design can deter crime incidents by increasing visibility and reinforcing ownership of spaces. To understand where CPTED interventions should occur, Table 2.3 identifies risk features in the highest risk category.
+<br>
+
+```{r cptedTab, include = TRUE}
+risk_in5th_table %>% 
+  scroll_box(width = "100%", height = "320px") %>%
+  footnote(general = "Table 2.3", general_title = "")
+```
+
+<br>
+The 20 locations with the highest predicted maltreatment count are chosen and the total count of abandoned vehicle and illegal dumping 311 calls within a quarter mile is calculated (Figure 2.13). 311 calls for abandoned vehicles and illegal dumping were chosen based on the closeness tests presented below in Section 3.4. These 20 locations are listed by count of 311 calls in Table 2.4.  
+
+```{r bufferRisk, include = TRUE, fig.height = 6.5, fig.width = 9}
+quarterMileBuffer_risk
+```
+
+<br>
+
+```{r top20riskTable, include = TRUE}
+riskAlign.buffers_TABLE %>% 
+  scroll_box(width = "100%", height = "320px") %>% 
+  footnote(general = "Table 2.4", general_title = "")
+```
+
+### 2.10 Gap Analysis
+
+The final component of the Align phase is to relate predicted risk and relative protection for each neighborhood throughout D.C. The gap analysis below does just this, visualizing in shades of red, those neighborhoods where there is more risk than protection. Conversely, shades of green show areas where protection outweighs risk. On the protective side, the gap analysis considers protective locations collected for the modeling process (i.e. police stations, community centers, homeless shelters, etc) as well as Collaborative and Families First DC locations. Future iterations of this map may include more relevant community interventions such as foster homes.
+
+```{r gapanalysis, include = TRUE, fig.height = 6.5}
+gapMap
+```
+
+The remainder of this report presents detailed results from the child welfare risk prediction model. Section 3 discusses the Exploratory Data Analysis. Section 4 presents Modeling and Validation. Section 5 concludes. The [Technical Appendix](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/) provides additional depth on motivation and methods for the framework.
+
+## 3. Data Preparation and Exploratory Analysis
+
+The geospatial risk prediction framework predicts maltreatment risk using a host of datasets provided by the Washington D.C. Child and Family Services Agency. In this section, approaches for data wrangling and feature engineering are discussed. In addition, Exploratory Data Analysis (EDA) is performed to provide additional context that is useful for understanding child maltreatment in Washington D.C. EDA brings additional hypothesis testing that helps inform the model and provide insight that may be more interpretable to a non-technical policy maker.
+
+There are three types of data collected for this analysis. The first includes the locations of child maltreatment events between 2015 and 2019. The second includes a series of risk and protective factors that may help explain the prevalence of child maltreatment in space. Examples include indicators of blight, childcare centers, and homeless shelters. The third set includes additional information to inform the strategic planning or Align phase discussed above. All data is georeferenced, meaning x and y coordinates locate each event on the surface of Earth.
+
+### 3.1 Maltreatment patterns across space and time
+
+Beginning with the child maltreatment location data, Figure 3.1 visualizes the count and spatial distribution of maltreatment across D.C. between 2015 and 2019. Although the count of maltreatment has grown slightly during the study period, the spatial distribution has remained consistent.
+
+```{r OT_OS_arrange, include = TRUE, fig.width = 8.5}
+cowplot::plot_grid(var_list[["ScreenedIn_Cases"]] %>%
+                     group_by(REPORTING_PERIOD) %>%
+                     summarise(count = n()) %>%
+                     ggplot(.) +
+                     geom_bar(aes(x = REPORTING_PERIOD, y = count), stat = "identity") +
+                     scale_y_continuous(limits = c(0, 1000)) +
+                     labs(title = "Number of maltreatment events\nby reporting period",
+                          caption = "Figure 3.1",
+                          y = "Count of Events",
+                          x = "Reporting Period") +
+                     plotTheme(), 
+                   ggmap(base_map) +
+                     geom_tile(data = year_dat,
+                               aes(x,y,fill = as.factor(ntile(value,brks)),
+                                   group = !!as.name(variable)), alpha=0.8) +
+                     scale_fill_viridis_d(name = variable) +
+                     labs(title = "Density of maltreatment events by year") +
+                     facet_wrap(vars(!!as.name(variable))) +
+                     mapTheme() +
+                     theme(
+                       legend.key = element_rect(fill = "white"),
+                       strip.text = element_text(face = "plain", size = 11, hjust = 0),
+                       strip.background = element_rect(fill = "white"),
+                       legend.position = "none"
+                       ), 
+                   ncol = 2, align = "hv", axis = "lrbt")
+```
+
+The underlying hypothesis of this work is that _exposure_ to various risk and protective factors predicts maltreatment risk in space. To test this hypothesis, we develop several approaches to relate maltreatment events and risk/protective factors in space. The first step is to overlay atop Washington D.C. 2,031 polygon grid cells, each with an area of 1000 ft<sup>2</sup>. The 'fishnet', as these grid cells are called, provides a standardized unit of prediction that both conforms to the assumptions of the statistical models and can provide targeted community engagement at a relevant spatial scale. Figure 3.2 visualizes the count of maltreatment events across the fishnet for each year. Figure 3.3 aggregates maltreatment counts for 2017, 2018, and 2019 and illustrates the maltreatment rate per 100 people.[^3] For more detail on how fishnet grid cell size is determined, please reference the Urban Spatial/PAP Technical Appendix [Section 4.2](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#42_feature_engineering).
+
+```{r malCOUNT_by_yr, include = TRUE, fig.width = 11, fig.height = 4}
+mal_3yr <- var_list[["ScreenedIn_Cases"]] %>%
+  filter(REPORTING_PERIOD %in% c("FY 2017", "FY 2018", "FY 2019"))
+values <- unique(mal_3yr[[variable]])
+dat_3yr <- list()
+for(i in seq_along(values)){
+  #print(values[i])
+  
+  dat <- filter(mal_3yr, !!as.name(variable) == values[i]) %>% 
+    mutate(value = 1) %>% 
+    dplyr::select(value) %>% 
+    aggregate(., net, sum) %>%
+    mutate(value = ifelse(is.na(value),0,value)) %>% 
+    .[unique(unlist(st_intersects(nbr, .))),] %>% 
+    mutate(class = case_when(value == 0 ~ "0", 
+                             value > 0 & value < 0.5 ~ "0.1 to 0.49",
+                             value >= 0.5 & value < 1 ~ "0.5 to 0.99",
+                             value >= 1 & value < 3 ~ "1 to 2.99",
+                             value >= 3 ~ "3+"))
+    #mutate(class = Hmisc::cut2(value, g = 9))
+  #make_cuts(., "value", cuts = "breaks", n_breaks = 10)
+  
+  dat_3yr[[i]] <- ggmap(base_map) +
+    geom_sf(data = ll(dat), aes(fill = class), 
+            color = NA, inherit.aes = FALSE, size = 0.5, alpha = 0.8) +
+    scale_fill_viridis_d(na.value = NA,
+                         name = "Count"#,
+                         #breaks = levels(dat$class),
+                         #labels = levels(dat$class)
+    ) +
+    labs(title = paste0("Count in ",values[i])) +
+    mapTheme()
+}
+
+cowplot::plot_grid(dat_3yr[[1]] + labs(caption = "Figure 3.2"), dat_3yr[[2]], dat_3yr[[3]], 
+                   ncol = 3, align = "hv", axis = "lrbt")
+```
+
+```{r malRateMAP, include = TRUE, fig.height = 4.5}
+ggmap(base_map) +
+  geom_sf(data = ll(net_mal_rate), aes(fill = cut_val), inherit.aes = FALSE, color = NA, alpha = 0.8) +
+  labs(title = "Matlreatment event rate per 100 people",
+       caption = "Figure 3.3") +
+  scale_fill_viridis_d(na.value = NA, 
+                       option = "D", 
+                       direction = 1, 
+                       name = "Rate\nper 100") +
+  mapTheme()
+```
+
+Maltreatment events are also summarized by two aggregate areas, neighborhoods and political wards. These are visualized in Figure 3.4 below.
+
+```{r nbr_ward_PLOT2, include = TRUE, fig.width = 8.5, fig.height = 4}
+mal_by_nbr_PLOT2 <- ggmap(base_map) +
+  geom_sf(data = ll(mal_by_nbr), aes(fill = cut_val), 
+          color = NA, alpha = 0.8, inherit.aes = FALSE) +
+  scale_fill_viridis_d(direction = 1,
+                       name="Count") +
+  labs(title = "Number of maltreatment events",
+       subtitle = "By neighborhood",
+       caption = "Figure 3.4") +
+  mapTheme()
+
+cowplot::plot_grid(mal_by_nbr_PLOT2, mal_by_ward_PLOT, ncol = 2, align = "hv", axis = "lrbt")
+```
+
+### 3.2 Risk and protective factors
+
+Twenty-nine different datasets are gathered as risk and protective features. These datasets are collected for 2017, but when 2017 data wasn't available, 2019 data is used. Crime and 311 call features are created from 2017 and 2018 incidents. The density of risk/protective features are mapped in Figures 3.5 and 3.6 below. 
+
+```{r KDE_protective_features, include = TRUE, fig.width=10, fig.height=12}
+PROTECTIVE_KDE_FACET_PLOT
+
+```
+
+```{r KDE_risk_features, include = TRUE, fig.width = 9, fig.height = 12}
+RISK_KDE_FACET_PLOT
+```
+
+Like maltreatment, each risk/protective factor is joined to the fishnet to test the exposure hypothesis. Risk and protective factors are aggregated to the fishnet using three different approaches:
+
+  1. Sum of risk/protective events per grid cell
+  2. The Euclidean distance from the center of each grid cell to the nearest risk/protective event
+  3. The average Euclidean distance from the center of each grid cell to the five nearest risk/protective neighbors.
+
+'Feature engineering' is the process of converting a variable like 'homeless shelters' to statistical information that can more directly help test the exposure hypothesis. Although a given risk/protective factor is engineered into the three different features, only one will be chosen for the final predictive model. Below is an example of the feature engineering approach. Additional context about this process can be found in [Section 4.2](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#42_feature_engineering) of the Urban Spatial/PAP Technical Appendix.
+
+```{r examplePlots, include = TRUE, fig.height = 6, fig.width = 8.5}
+cowplot::plot_grid(shelters_map, shelters_agg_map,
+                   shelters_ed_map + labs(caption = "Figure 3.7"), shelters_NN_map, 
+                   align="hv", axis = "rlbt", ncol=2)
+```
+
+### 3.3 Do maltreatment events cluster?
+
+The plots of count of maltreatment events by grid cell, neighborhood, and per 100 people all show a higher number of maltreatment events in Southeast DC (Figures 3.2, 3.3, and 3.4) . We further explore the spatial relationship of maltreatment events by testing whether statistically significant clustering of maltreatment exists.
+
+Maltreatment events that 'cluster' are those that are closer to one another than what might otherwise be expected due to random chance alone. The Global Moran's I test indicates clustering of maltreatment events does exist, with a statistic of `r round(globalMorans$statistic,2)` and a p-value of `r globalMorans$p.value`. The Local Moran's I analysis provides a hypothesis test of geographic clustering. Figure 3.8 below visualizes statistically significant maltreatment clusters (p <= 0.05) using 2017, 2018, and 2019 maltreatment data. More detail on the Local Moran's I test can be found in the Urban Spatial/PAP Technical Appendix [Section 5.3](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#5_exploratory_data_analysis).
+
+While the maps below provide an engaging indicator of maltreatment activity, there is an important conceptual reason why clustering is important for this analysis. It could be that maltreatment clusters in space because environmental risk and protective factors enable this behavior. It could also be that individuals predisposed to engage in maltreatment sort into communities with these risk and protective features. As discussed in Technical Appendix [Section 1](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#1_introduction), this dynamic referred to as 'neighborhood effects' plays an important role in the generation of maltreatment. The models explained in Section 4.2 below include a feature to account for this clustered neighborhood effect.
+
+```{r localMoransPLOT, include = TRUE, fig.width = 8.5, fig.height = 3}
+MORANS_I_P_plot
+
+```
+
+### 3.4 Are risk and protective factors 'close' to maltreatment?
+
+One way to re-conceive of the notion that exposure to a risk factor is related to maltreatment, is to consider their relative closeness. In other words, are certain risk/protective factors closer to maltreatment than what might otherwise be expected due to random chance alone? Typically, statistical correlation is measured to understand the relationship between risk/protective factors and maltreatment, as we do in Section 3.5 below. However, because the hypothesis relates these phenomena spatially, it is perhaps more reasonable to derive a measure of spatial correlation.
+
+One way to reconceive the notion that exposure to a risk factor is related to maltreatment, is to consider their relative closeness. In other words, are certain risk/protective factors closer to maltreatment than what might otherwise be expected due to random chance alone.
+
+Here is how it works. Imagine a large assembly hall full of primary school children and a set of teachers whose job it is to keep the kids quiet and focused. Assuming the locations of students and teachers were plotted on a map, are the teachers close enough to the students to provide supervision or randomly spread out across the room? To answer this question a test is developed as below.
+
+  1. The _observed_ distance from each student to his or her nearest teacher is measured and the _average nearest neighbor distance_ is recorded for all student/teacher pairs.
+  2. The teachers are then _randomly_ relocated across the map, and again the distance from each kid to the nearest teacher is recorded and the average taken across pairs.
+  3. Step 2 is repeated 999 times to generate a distribution of randomly generated average nearest neighbor distances.
+  4. If the _observed_ nearest neighbor distance is less (i.e. closer) than say, 95% of the _randomly_ generated distances, it is possible to conclude with a p-value of 0.05, that teachers are close to students.
+
+This same procedure is used to test the spatial relationship between risk/protective factors and maltreatment. For more detail, please reference [Section 5.4](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#5_exploratory_data_analysis) of the Urban Spatial/PAP Technical Appendix. Results are plotted for protective, crime-related, and other risk factors in Figures 3.9, 3.10, and 3.11 respectively. The vertical black bar measures the observed nearest neighbor distance between a given factor and maltreatment. The colored histogram represents the randomly distributed nearest neighbor distances. The farther the former is from the latter, the more significant the closeness test is.
+
+Homeless shelters, police stations, and food banks are the closest protective factors to maltreatment. Homicide, assault with a deadly weapon, and robbery are the most significant crime-related risk factors. Public housing, abandoned vehicles, and illegal dumping are the three closest non-crime risk factors. The conclusion that emerges from this analysis is that blight is a powerful predictor of maltreatment risk in Washington D.C.
+
+```{r closeness_PLOT_1, include = TRUE, fig.height=17}
+PROTECTIVE_CLOSE_plot
+
+```
+
+
+```{r closeness_PLOT_2, include = TRUE, fig.height=8.5}
+CRIME_CLOSE_plot
+
+
+```
+
+
+```{r closeness_PLOT_3, include = TRUE, fig.height=15}
+RISK_CLOSE_plot
+```
+
+
+### 3.5 Pairwise correlations
+
+More than 100 total features are created from this analysis, including 29 risk and protective factors engineered into 87 features, 17 census control features, and a feature controlling for the clustered, neighborhood effects phenomena discussed in Section 3.3. To help determine which features will be the best predictors of maltreatment, pairwise correlations are calculated between maltreatment count for each grid cell (`netmal_1718`) and a given feature. Figures 3.12 and 3.13 visualize the pairwise correlations for the top 15 most correlative protective and risk factors. Information on pairwise correlations can be found in the Urban Spatial/PAP Technical Appendix [Section 5.2](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#52_visualizing_the_correlation_between_each_variable).
+
+There are three different prefixes associated with each type of feature (see Section 3.1 above for each further description): `NN` refers to features calculated by taking the average distance between a fishnet grid cell and its _n_ nearest risk/protective factor neighbor; `ed` refers to the Euclidean distance between a fishnet grid cell and its one nearest risk/protective factor neighbor; `agg` refers to the count of risk/protective factor events in a given fishnet grid cell.
+
+A correlation of '1' means a perfect positive correlation between maltreatment and the risk/protective feature. The correlation for the `agg_Vio.1718_Abandoned.Vehicle.On.Public.Property` feature suggests that as the count of abandoned vehicles increases, there is a noticeable increase in maltreatment count. Conversely, a correlation of '-1' means perfect negative correlation. The correlation for `NN_SNAP` suggests when distance to SNAP retailers increases (gets farther away) maltreatment count decreases.
+
+```{r protective_corr_plot, include = TRUE, fig.height=10.5,fig.width=11}
+protective_cp <- feature_corrplot(features_protective_strong, "Correlation of protective features")
+mtext("Figure 3.12", cex = .895, side = 1, line = 4, at = -2, font = 3)
+```
+
+```{r risk_corr_plot, include = TRUE, fig.height=14,fig.width=14}
+risk_cp <- feature_corrplot(features_risk_strong, "Correlation of risk features")
+mtext("Figure 3.13", cex = .95, side = 1, line = 4, at = -2, font = 3)
+```
+
+## 4. Predictive Model Estimation and Validation
+
+The following section presents the final risk model and illustrates several validation metrics. For details on the modeling process and the validation tests, please reference the Urban Spatial/PAP Technical Appendix [Section 6](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#6_model_fitting_and_stacking) and [Section 7](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#7_model_validation) respectively.
+
+Exploratory Data Analysis explored both spatial and statistical correlations between maltreatment and individual risk/protective factors. In this section, those features with the greatest pairwise correlations are entered into a a series of predictive regression models to predict maltreatment risk across Washington D.C.
+
+### 4.1 Accuracy and generalizability
+
+The goal of the predictive modelling process is to create a 'useful' tool to help child welfare stakeholders better allocate limited community intervention resources in space. Two indicators are used to judge usefulness - accuracy and generalizability. Accuracy is a measure of error - that there is little difference between the observed count of maltreatment and the predicted count. Generalizability is a measure of consistency - that the accuracy varies little across different areas of the city. While the [Technical Appendix](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/) provides lengthy context on the accuracy/generalizability trade-off, there are two key concepts to consider.
+
+First, a predictive model that is 100% accurate is not useful. Recall from Section 1 above, that the goal of this analysis is to predict latent risk of maltreatment - that is, places where maltreatment may be occurring, but because it's a rare event, it goes unreported. Thus, some model error correctly assumes predicted risk is greater than observed maltreatment.
+
+Secondly, a predictive model that does not generalize well to different urban contexts is also not useful. A model that predicts accurately in one type of neighborhood but not another is not generalizable and thus, not a fair tool to guide resource allocation across the entire city. Recall from Section 1, that the intuition of this geospatial risk prediction approach is to borrow the observed maltreatment 'experience' in D.C. and test whether that experience generalizes to places where maltreatment may be occurring but is not directly observed. If this experience is generalizable, it is reasonable to confidently forecast maltreatment risk across space. The entire modeling framework, explained below, is based around this idea of a 'generalizable maltreatment experience.'
+
+### 4.2 The modeling framework
+
+Maltreatment counts and associated risk/protective features for 2017 and 2018 are joined to the fishnet and used to predict maltreatment in 2019. 'Training' the predictive model on two years and 'testing' predictions for a subsequent year provides a convenient generalizability test for how useful the resource allocation tool is to the near future.
+
+There are three different predictive algorithms employed - Poisson regression, Spatial Durbin and Random Forest, explained in more depth in [Section 6.2](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#62_model_fitting) of the Technical Appendix. These three models each pick up on different patterns in the empirical relationship between maltreatment and risk/protective factors. Poisson is a simple Generalized Linear Model; Spatial Durbin is a algorithm uniquely suited for observing spatial relationships; and Random Forest is a powerful, contemporary machine learning algorithm. To capitalize on the nuances of each, an 'ensemble' or meta-model approach blends together predictions from all three into a final set of predictions.
+
+In order to test for spatial generalizability - model accuracy across space - further blending is done by partitioning the fishnet into 46 neighborhood groups. Leave-one-group-out cross-validation (LOGOCV) is used to then train the model on _n - 1_ groups and predict for the hold out. This ensures that predictions for any one place are informed by a general set of experiences from across the city. For more information on LOGOCV, please refer to [Section 6.3](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#63_leave_one_group_out_cross_validation) of the Urban Spatial/PAP Technical Appendix.
+
+Three outlier grid cells were assigned the mean observed maltreatment count for that cell's adjacent 8 grid cell neighbors upon consultation with D.C. Child and Family Services Agency. These areas with very high, outlying maltreatment counts contained homeless shelters that have all since closed. As they are no longer operating, the maltreatment experience in those places no longer generalizes.
+
+### 4.3 Model accuracy
+
+Accuracy is the difference between the observed maltreatment counts across the fishnet and the predicted maltreatment counts. This section presents several measures of model accuracy. Figure 4.1 below plots the predicted count on the y-axis as a function of the observed count on the x-axis for each of the three models used.
+
+In general all models systematically underpredict areas that have very high observed maltreatment counts. There are only a handful of places that have more than a dozen maltreatment events in 2017 and 2018. Given how rare these specific experiences are, it is not surprising that the LOGOCV process yields higher errors.
+
+```{r fit_plot_1, include=TRUE, fig.width = 8.5, fig.height = 3.5}
+submodel_fit_PLOTS
+```
+
+Figure 4.2 plots the predicted and observed maltreatment counts for the ensembled meta-model or blend of all three submodels. In general, the model fits well for most of the data, again with exception to the underprediction for grid cells with very high counts. Note that places with moderate counts of observed maltreatment events - perhaps 5-10, are actually overpredicted slightly. This is the intent of the model, as these are areas predicting latent risk - predicted maltreatment that is otherwise unreported.
+
+```{r fit_plot_2, include = TRUE, fig.height = 6}
+META_MODEL_FIT_plot
+```
+
+Table 4.1 provides a number of goodness of fit metrics (for more information refer to Technical Appendix [Section 7.1](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#71_goodness_of_fit_metrics)). There are two metrics worth interpreting here. First the `MAE` or Mean Absolute Error is a measure of accuracy and is interpreted as the difference (or error) between the observed and predicted maltreatment count; averaged across all holdout neighborhoods and on an absolute basis (meaning an indifference for over versus underprediction). The `MAE` for the meta-model suggests that on average, the model errs less than one half of one maltreatment event.
+
+The second metric suitable for interpretation here is the `MAE_sd` or the standard deviation of the Mean Absolute Error across each neighborhood holdout. A relatively high value suggests that the model errs differently across different communities. A low value suggests errors are consistent across different neighborhoods. This is a useful measure of generalizability and one quite robust for this analysis.
+
+```{r modTab, include = TRUE}
+Model_Error_Results_table %>% 
+  footnote(general = "Table 4.1", general_title = "")
+```
+
+Figure 4.3 below maps geospatial risk predictions and `MAE`s for each model type and the meta-model. These maps make it clear that again, each of the individual models are picking up different relationships in the data.
+
+```{r errorMaps, include = TRUE, fig.height=12.5, fig.width = 8.5}
+cowplot::plot_grid(po_pred_geoplot[[2]] +
+                     labs(title = "Poisson Regression",
+                          subtitle = "Predicted Maltreatment Count"),
+                   po_pred_geoplot[[1]] +
+                     labs(subtitle = "MAE"), 
+                   rf_pred_geoplot[[2]] +
+                     labs(title = "Random Forest",
+                          subtitle = "Predicted Maltreatment Count"),
+                   rf_pred_geoplot[[1]] +
+                     labs(subtitle = "MAE"), 
+                   sarlm_pred_geoplot[[2]] +
+                     labs(title = "Spatial Durbin Model",
+                          subtitle = "Predicted Maltreatment Count"),
+                   sarlm_pred_geoplot[[1]] +
+                     labs(subtitle = "MAE"), 
+                   ens_pred_geoplot[[2]] +
+                     labs(title = "Meta-Model",
+                          subtitle = "Predicted Maltreatment Count",
+                          caption = "Figure 4.3"),
+                   ens_pred_geoplot[[1]] +
+                     labs(subtitle = "MAE"), align = "hv", axis = "lrbt", ncol = 2)
+
+
+#cowplot::plot_grid(ncol = 1, align = "hv", axis = "lrbt", POISSON_MODEL_PREDICTION_MAP_plot, RF_MODEL_PREDICTION_MAP_plot, SARLM_MODEL_PREDICTION_MAP_plot, META_MODEL_PREDICTION_MAP_plot)
+```
+
+Figure 4.4 below visualizes the risk predictions and `MAE` for only the meta-model with national parks and hydrology masked. Several key neighborhoods are predicted to be at high risk including Anacostia and Columbia Heights. In general, higher errors appear where there are higher maltreatment counts, but errors are mostly diffused throughout the city.
+
+```{r metamodel_errormap_withMask, include = TRUE, fig.height = 4, fig.width = 8.5}
+metamodel_error_plot_mask
+```
+
+Figure 4.5 takes the mean error by neighborhood.
+
+```{r spatialCVPLOT, include = TRUE, fig.height = 5}
+MAE_BY_NEIGHBORHOOD_plot
+```
+
+
+### 4.4 Generalizability
+
+Generalizability is the ability for the model to predict with consistent accuracy across different urban contexts. In this section, several tests for generalizability are provided. To begin, Washington D.C. is split into high and low areas with respect to non-white and poverty. These typologies are visualized in Figure 4.6 below.
+
+```{r typo_breakdown, include = TRUE, fig.width = 8.5, fig.height = 4}
+typoMAPS
+```
+
+Recall from Table 4.1 above that the overall MAE for the Meta-Model is 0.475. Figure 4.7 calculates average MAE by neighborhoods for the aforementioned typologies. While areas with larger minority populations and higher poverty levels have higher prediction errors, they also happen to have far higher observed maltreatment counts. Areas with fewer non-white residents and less poverty have observed maltreatment counts of 16 and 17, respectively. Areas with more non-white population and more poverty have observed maltreatment counts of 65 and 64, respectively. We therefore feel the model is generalizable, meaning it is useful as a resource allocation tool. Further, the difference in MAE between these typologies is driven by the large difference in maltreatment occurance.
+
+```{r nbr_typo_plots, include = TRUE, fig.width = 8.5}
+typo_compare_PLOT
+```
+
+
+### 4.5 Feature importance
+
+To better understand which features had the greatest contribution to predicting child maltreatment, Variable Importance analytics from the random forest sub-model is plotted in Figure 4.8.
+
+The most important predictor is 'NN_ScreenedIn' which is a feature created to account for the local clustering of maltreatment events, also referred to as 'neighborhood effects' in Section 3.3. Other features found important in the modeling process include a fixed effect (i.e. dummy variable) to control for each neighborhood, crime variables (assaults with dangerous weapons and sexual abuse crimes), as well as variables that indicate neighborhood blight (311 calls for abandoned vehicles and vacant homes).
+
+```{r varImportance, include = TRUE, fig.height=8, fig.width = 8}
+RF_VARIMP_PLOT
+
+```
+
+### 4.6 Does the risk prediction model outperform standard hot spot maps?
+
+Kernel density is the traditional approach for creating hot spots maps used for targeting interventions in space. In this section, the usefulness of the meta-model as a resource allocation tool is tested relative to kernel density. For more information, please refer to to [Section 7.3](https://urbanspatial.github.io/UrbanSpatial_PAP_TechAppendix/#73_comparing_meta-model_predictions_to_kernel_density) in the Technical Appendix. As a further test of temporal generalizability, the meta-model, trained on 2017 and 2018 data, is tested against 2019 maltreatment data. 
+
+To begin, the kernel density 'predictions' and meta-model predictions are both grouped into five risk categories, in ascending order of risk. Figure 4.9 below visualize the five predicted risk categories with 2019 maltreatment points overlaid, perturbed slightly to maintain privacy. The maps make it clear first, that the 2017/2018 predictions generalize to the 2019 maltreatment experience and second, that the meta-model provides a much more accurate resource allocation tool. It is also worth noting that other areas show up as high risk areas despite containing few or no 2019 maltreatment events. These are areas identified by the model as having latent risk for maltreatment. 
+
+```{r comparisonMAPS, include = TRUE, width = 8.5, fig.height = 4.5}
+cowplot::plot_grid(ggmap(base_map) +
+                     geom_sf(data = ll(kde.summ), aes(fill = factor(sens_group)),
+                             color = NA, alpha = 0.85, inherit.aes = FALSE) +
+                     geom_sf(data = st_jitter(ll(st_difference(points.2019) %>%
+                                                   .[bind_cols(error_geoplot,
+                                                               aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                                       filter(counter != 1),]), 0.0025),
+                             inherit.aes = FALSE, size = 0.75)  +
+                     scale_fill_viridis_d(na.value = NA, option = "D", direction = 1,
+                                          name = "Risk\nCategory") +
+                     labs(title = "KDE risk categories\noverlaid with 2019 screened-in cases",
+                          caption = "Figure 4.9\nPrivacy Controls: Maltreatment events in grid cells\nwith 1 point are masked; Remaining event\nlocations are offset at random") +
+                     mapTheme(),
+                   ggmap(base_map) +
+                     geom_sf(data = ll(p.summ), aes(fill = factor(sens_group)),
+                             color = NA, alpha = 0.85, inherit.aes = FALSE) +
+                     geom_sf(data = st_jitter(ll(st_difference(points.2019) %>%
+                                                   .[bind_cols(error_geoplot,
+                                                               aggregate(mutate(., counter = 1), error_geoplot, length)) %>%
+                                                       filter(counter != 1),]), 0.0025),
+                             inherit.aes = FALSE, size = 0.75) +
+                     scale_fill_viridis_d(na.value = NA, option = "D", direction = 1,
+                                          name = "Risk\nCategory") +
+                     labs(title = "Meta-model risk categories\noverlaid with 2019 screened-in cases") +
+                     mapTheme(),
+                   ncol = 2, align = "hv", axis = "lrbt") 
+```
+
+If the meta-model predictions are more useful than the kernel density, the former should capture a greater proportion of 2019 maltreatment events in the highest risk category relative to the latter. The bar plot in Figure 4.10 suggests this is true, reaffirming the message conveyed in Figure 4.9. The meta-model provides a useful tool for allocating community interventions in space.
+
+```{r comparisonBARPLOT, include = TRUE, fig.width = 8.5}
+RELATIVE_RISK_BARPLOT_COMPARE_plot
+
+```
+
+## 5. Conclusion
+
+Between 2017 and 2019, Washington, D.C. had 2,763 confirmed cases of child maltreatment, with many incidents clustering in Southeast D.C. The goal of the geospatial risk prediction model developed in this report is to help Washington D.C. optimally allocate limited child welfare resources where they are most needed. This is done by hypothesizing that maltreatment risk is a function exposure to geospatial risk and protective factors. Many of the important risk factors responsible for predicting this behavior include blight, crime, and the neighborhood effect, which helps account for the fact that maltreatment tends to cluster in space.
+
+Section 4 presents the predictive model, which not only accurately predicts areas with known maltreatment as high risk, but predicts the latent risk - places where maltreatment may be occurring but is not reported. The model provides more useful predictions relative to the more traditional kernel density approach. 
+
+The Align phase converts risk predictions into actionable intelligence by providing a simple to use strategic planning tool that stakeholders can use to allocate community intervention resources. Given the open source nature of this tool, it can be updated for free annually to analyze change in maltreatment risk citywide.
+
+ <br>
+ <br>
+ <br>
+
+[^1]: The Align Phase (Section 2) was created using the masked meta-model predictions. As a result of the mask, a marginal amount of the total population was removed.
+
+[^2]: The Child and Family Services Agency sent the addresses of the Collaborative and Families First DC locations to Urban Spatial. From this data, one address was missing, one center had multiple addresses listed from which the first address was used in geocoding, and one address could not be geocoded (returned no x/y coordinates).  
+
+[^3]: This table presents summary statistics of maltreatment events for 2017, 2018, 2019.<br> `r sum_stats_table`
